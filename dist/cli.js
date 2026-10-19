@@ -180,7 +180,7 @@ var SEL = {
   agentItem: ".sand-agent-item[data-agent-id]",
   prompt: '.sand-prompt-field[aria-label="Prompt"], [role="textbox"].ProseMirror',
   row: ".sand-transcript-row[data-row-key]",
-  busy: '[data-grok-state="working"]'
+  busy: '[data-grok-state]:not([data-grok-state="idle"])'
 };
 var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
 var PAGE_LIST_BOTS = `(sel) => [...document.querySelectorAll(sel)].map((e) => {
@@ -295,7 +295,7 @@ async function send(cdp, botQuery, text) {
 }
 async function ask(cdp, botQuery, text, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 300000;
-  const settleMs = opts.settleMs ?? 12000;
+  const settleMs = opts.settleMs ?? 8000;
   const t0 = Date.now();
   const target = await openBot(cdp, botQuery);
   const sentKey = await sendToOpen(cdp, text);
@@ -359,7 +359,7 @@ var TOOLS = [
         bot: { type: "string", description: "Bot name (e.g. 'Chief') or id" },
         message: { type: "string", description: "The message to send, written like a request to a teammate" },
         timeout_seconds: { type: "number", description: "Max seconds to wait for replies (default 300, max 1800)" },
-        settle_seconds: { type: "number", description: "Idle seconds before the reply counts as finished (default 12)" }
+        settle_seconds: { type: "number", description: "Idle seconds before the reply counts as finished (default 8)" }
       },
       required: ["bot", "message"],
       additionalProperties: false
@@ -413,7 +413,7 @@ async function callTool(name, args) {
       return withApp((c) => listBots(c));
     case "grokbot_ask": {
       const t = Math.min(Math.max(Number(args.timeout_seconds ?? 300), 10), 1800);
-      const settle = Math.min(Math.max(Number(args.settle_seconds ?? 12), 2), 120);
+      const settle = Math.min(Math.max(Number(args.settle_seconds ?? 8), 2), 120);
       return withApp((c) => ask(c, str("bot"), str("message"), { timeoutMs: t * 1000, settleMs: settle * 1000 }));
     }
     case "grokbot_send":
@@ -486,7 +486,7 @@ Usage:
 
 Options:
   --timeout <sec>   ask: max seconds to wait (default 300)
-  --settle <sec>    ask: idle seconds before the reply counts as finished (default 12)
+  --settle <sec>    ask: idle seconds before the reply counts as finished (default 8)
   --limit <n>       read: number of messages (default 10)
   --json            Machine-readable output
   --quiet           ask: don't stream progress to stderr
@@ -600,7 +600,7 @@ async function main() {
       const timeoutMs = positiveNumber(flags.timeout, "timeout", 300) * 1000;
       const r = await withApp2((c) => ask(c, bot, msg, {
         timeoutMs,
-        settleMs: positiveNumber(flags.settle, "settle", 12) * 1000,
+        settleMs: positiveNumber(flags.settle, "settle", 8) * 1000,
         onUpdate: flags.quiet ? undefined : (m) => console.error(`[grokbot] ${m.role === "card" ? "card" : "reply"}: ${m.text.slice(0, 100).replace(/\s+/g, " ")}`)
       }));
       out(r, () => {

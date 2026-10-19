@@ -70,7 +70,7 @@ grokbot read Chief             # recent messages in that conversation
 | `grokbot restore` | Restart Grok Bot normally, closing the port |
 | `grokbot mcp` | Run as an MCP server over stdio |
 
-Options: `--json` for machine-readable output, `--timeout <sec>` for `ask` (default 300), `--settle <sec>` for how long a Bot must stay idle before `ask` returns (default 12), `--quiet` to stop progress lines on stderr. Pass `-` as the message to read it from stdin.
+Options: `--json` for machine-readable output, `--timeout <sec>` for `ask` (default 300), `--settle <sec>` for how long a Bot must stay idle before `ask` returns (default 8), `--quiet` to stop progress lines on stderr. Pass `-` as the message to read it from stdin.
 
 `ask` exits with code `2` if the Bot is still working when the timeout hits. Bots often acknowledge first and report back minutes later, so use `grokbot read <bot>` to collect the rest.
 
@@ -121,7 +121,7 @@ Grok Bot is an Electron app. `grokbot launch` restarts it with Chromium's `--rem
 
 1. Opens the Bot's conversation from the sidebar (`data-agent-id`).
 2. Types into the message box and presses Enter.
-3. Watches the transcript (`data-role="assistant"` rows) and the Bot's working indicator (`data-grok-state`) until the Bot has been idle for a few seconds.
+3. Watches the transcript (`data-role="assistant"` rows) and the Bot's activity marks (`data-grok-state`: `working`, `running` while it uses tools, `streaming` while it types) until every mark has been `idle` for a few seconds.
 
 Messages go through the app's normal send path, so they show up in your conversation history like any message you typed. The bridge makes no network calls of its own and has no runtime dependencies.
 

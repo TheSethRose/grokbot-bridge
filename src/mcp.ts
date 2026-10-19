@@ -22,7 +22,7 @@ const TOOLS = [
         bot: { type: "string", description: "Bot name (e.g. 'Chief') or id" },
         message: { type: "string", description: "The message to send, written like a request to a teammate" },
         timeout_seconds: { type: "number", description: "Max seconds to wait for replies (default 300, max 1800)" },
-        settle_seconds: { type: "number", description: "Idle seconds before the reply counts as finished (default 12)" },
+        settle_seconds: { type: "number", description: "Idle seconds before the reply counts as finished (default 8)" },
       },
       required: ["bot", "message"],
       additionalProperties: false,
@@ -79,7 +79,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return withApp((c) => listBots(c));
     case "grokbot_ask": {
       const t = Math.min(Math.max(Number(args.timeout_seconds ?? 300), 10), 1800);
-      const settle = Math.min(Math.max(Number(args.settle_seconds ?? 12), 2), 120);
+      const settle = Math.min(Math.max(Number(args.settle_seconds ?? 8), 2), 120);
       return withApp((c) => ask(c, str("bot"), str("message"), { timeoutMs: t * 1000, settleMs: settle * 1000 }));
     }
     case "grokbot_send":

@@ -7,7 +7,8 @@ const SEL = {
   agentItem: ".sand-agent-item[data-agent-id]",
   prompt: '.sand-prompt-field[aria-label="Prompt"], [role="textbox"].ProseMirror',
   row: ".sand-transcript-row[data-row-key]",
-  busy: '[data-grok-state="working"]',
+  // Bot activity marks cycle working → running (tools) → streaming (typing) → idle.
+  busy: '[data-grok-state]:not([data-grok-state="idle"])',
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -152,8 +153,8 @@ export type AskOptions = { timeoutMs?: number; settleMs?: number; onUpdate?: (m:
  */
 export async function ask(cdp: CDP, botQuery: string, text: string, opts: AskOptions = {}): Promise<AskResult> {
   const timeoutMs = opts.timeoutMs ?? 300_000;
-  // Bots often acknowledge, pause, then start working, so idle must last a while before we call it done.
-  const settleMs = opts.settleMs ?? 12_000;
+  // Covers brief idle gaps between a Bot's turns, such as after an acknowledgment.
+  const settleMs = opts.settleMs ?? 8_000;
   const t0 = Date.now();
   const target = await openBot(cdp, botQuery);
   const sentKey = await sendToOpen(cdp, text);

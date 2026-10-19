@@ -19,7 +19,7 @@ Usage:
 
 Options:
   --timeout <sec>   ask: max seconds to wait (default 300)
-  --settle <sec>    ask: idle seconds before the reply counts as finished (default 12)
+  --settle <sec>    ask: idle seconds before the reply counts as finished (default 8)
   --limit <n>       read: number of messages (default 10)
   --json            Machine-readable output
   --quiet           ask: don't stream progress to stderr
@@ -130,7 +130,7 @@ async function main() {
       const r = await withApp((c) =>
         ask(c, bot, msg, {
           timeoutMs,
-          settleMs: positiveNumber(flags.settle, "settle", 12) * 1000,
+          settleMs: positiveNumber(flags.settle, "settle", 8) * 1000,
           onUpdate: flags.quiet
             ? undefined
             : (m) => console.error(`[grokbot] ${m.role === "card" ? "card" : "reply"}: ${m.text.slice(0, 100).replace(/\s+/g, " ")}`),
