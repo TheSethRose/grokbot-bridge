@@ -167,7 +167,7 @@ Weekly usage: 1.37% used · resets 10/22/2026, 11:44:33 AM (in 4 days) · plan: 
 
 `create`, `update` and `delete` call the same Bot-list client the app's own New Bot, rename and delete actions use. The main Bot can't be deleted.
 
-Bot edits and routine changes are saved on the Bot's cloud computer. The bridge first sends the app's own "user is here" signal, the same one clicking into a message box sends. If nobody has used the Mac for a while, Grok Bot parks the computer (`SAND_AWAY_PARK`) and these changes fail with a message saying so until someone uses the Mac again. Messages still go through while it's parked.
+Bot edits and routine changes are saved on the Bot's cloud computer. The bridge first sends the app's own "user is here" signal, the same one clicking into a message box sends. Grok Bot keeps the computer asleep (`SAND_AWAY_PARK`) while it thinks nobody is at the Mac: the screen is locked, the Mac is asleep, or the Grok Bot window has been out of focus for 10 minutes with no input macOS counts. Some virtual keyboards (Karabiner's, for one) don't reset that count, so typing in another app may not help. These changes then fail with a message saying so; bring the Grok Bot window to the front for about 15 seconds and try again. Messages still go through while it's parked.
 
 Messages go through the app's normal send path, so they show up in your conversation history like any message you typed. The bridge makes no network calls of its own and has no runtime dependencies.
 

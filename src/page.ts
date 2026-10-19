@@ -28,13 +28,15 @@ export const ACCOUNT_SLOT = `(${contextValue(`typeof v.accountSlot === "string"`
 
 /**
  * Turns an app failure (which carries a code) or any thrown value into a readable message. Page-side.
- * "Parked" means Grok Bot paused the Bot's computer because nobody is using this Mac; messages still
- * queue, but changes to the computer (routines, Bot settings) wait until someone is back.
+ * Away-park: Grok Bot keeps the Bot's computer asleep while it thinks nobody is at this Mac, meaning
+ * the screen is locked, the Mac is asleep, or the Grok Bot window has been unfocused for 10 minutes
+ * with no input macOS counts (some virtual keyboards, such as Karabiner's, don't reset that count).
+ * Messages still queue, but changes to the computer (routines, Bot settings) fail until then.
  */
 export const PAGE_ERROR = `(e) => {
   const f = e && e.failure;
   if (f && f.code === "sand-box-blocked" && /PARK/.test(f.sandBoxBlockReason || ""))
-    return "Grok Bot paused the Bot's computer because nobody is using this Mac (" + f.sandBoxBlockReason + "). Use the Mac (move the mouse or type), then try again.";
+    return "Grok Bot is keeping the Bot's computer asleep because it thinks nobody is at this Mac (" + f.sandBoxBlockReason + "). Bring the Grok Bot window to the front, wait about 15 seconds, then try again.";
   if (f && f.code) return f.code + (e.message && e.message !== f.code ? ": " + e.message : "");
   return String((e && e.message) || e);
 }`;
@@ -49,7 +51,7 @@ export const PAGE_AWAKE = `async (id, fn) => {
     await Promise.resolve(window.desktop?.main?.signalBoxIntent?.({ agentId: id, intent: "composer_focus" })).catch(() => {});
     try { return await fn(); } catch (e) {
       const f = e && e.failure;
-      // Away-park lasts until someone uses the Mac, so retrying won't help.
+      // Away-park lasts until the user is back in Grok Bot, so retrying won't help.
       if (i >= 8 || !(f && f.code === "sand-box-blocked") || f.sandBoxBlockReason === "SAND_AWAY_PARK") throw e;
       await new Promise((s) => setTimeout(s, 1500));
     }

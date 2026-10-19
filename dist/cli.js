@@ -204,7 +204,7 @@ var ACCOUNT_SLOT = `(${contextValue(`typeof v.accountSlot === "string"`)} || {})
 var PAGE_ERROR = `(e) => {
   const f = e && e.failure;
   if (f && f.code === "sand-box-blocked" && /PARK/.test(f.sandBoxBlockReason || ""))
-    return "Grok Bot paused the Bot's computer because nobody is using this Mac (" + f.sandBoxBlockReason + "). Use the Mac (move the mouse or type), then try again.";
+    return "Grok Bot is keeping the Bot's computer asleep because it thinks nobody is at this Mac (" + f.sandBoxBlockReason + "). Bring the Grok Bot window to the front, wait about 15 seconds, then try again.";
   if (f && f.code) return f.code + (e.message && e.message !== f.code ? ": " + e.message : "");
   return String((e && e.message) || e);
 }`;
@@ -213,7 +213,7 @@ var PAGE_AWAKE = `async (id, fn) => {
     await Promise.resolve(window.desktop?.main?.signalBoxIntent?.({ agentId: id, intent: "composer_focus" })).catch(() => {});
     try { return await fn(); } catch (e) {
       const f = e && e.failure;
-      // Away-park lasts until someone uses the Mac, so retrying won't help.
+      // Away-park lasts until the user is back in Grok Bot, so retrying won't help.
       if (i >= 8 || !(f && f.code === "sand-box-blocked") || f.sandBoxBlockReason === "SAND_AWAY_PARK") throw e;
       await new Promise((s) => setTimeout(s, 1500));
     }

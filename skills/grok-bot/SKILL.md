@@ -58,7 +58,7 @@ A routine is a saved prompt the Bot runs on a schedule, which is how recurring m
 - Add, enable or run a routine only when the user asked for that routine. Show them the name, schedule and prompt you used.
 - Write the prompt like any brief, including the boundary ("Research only…") and when to message the user ("only if something changed").
 - Delete a routine only when the user asked to delete that one.
-- If a change fails with "nobody is using this Mac" (`SAND_AWAY_PARK`), Grok Bot has paused the Bot's computer until the user is back. Messages still work. Tell the user, and don't retry in a loop.
+- If a change fails with "nobody is at this Mac" (`SAND_AWAY_PARK`), Grok Bot is keeping the Bot's computer asleep. Ask the user to bring the Grok Bot window to the front for about 15 seconds, then retry once. Messages still work. Don't retry in a loop.
 
 ## What to delegate
 

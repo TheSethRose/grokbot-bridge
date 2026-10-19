@@ -36,7 +36,7 @@
 
 - Live tests act on the user's real account: messages land in their Bot's history and use their weekly Grok Bot usage. Keep test messages short, labelled as tests, and research-only. Delete only the test routines or Bots you created yourself.
 - Never answer a Bot's approval cards or questions programmatically; report `needs_input` to the user.
-- When Grok Bot parks the Bot's computer because nobody is using the Mac (`SAND_AWAY_PARK`), don't try to fake user presence. Report it and retry after the user is back.
+- `SAND_AWAY_PARK` means Grok Bot thinks nobody is at the Mac: screen locked, Mac asleep, or its window unfocused for 10 minutes with no input in macOS's idle count (`HIDIdleTime`, which Karabiner's virtual keyboard doesn't reset). Don't fake presence or focus the window yourself; ask the user to bring Grok Bot to the front, then retry.
 - Don't print or log the account slot, cookies or other identifiers read from the app beyond what a command needs.
 - Keep `delete` and `routines remove` behind `--yes` (CLI) and `confirm` (MCP), with exact-name matching.
 
