@@ -152,7 +152,8 @@ export type AskOptions = { timeoutMs?: number; settleMs?: number; onUpdate?: (m:
  */
 export async function ask(cdp: CDP, botQuery: string, text: string, opts: AskOptions = {}): Promise<AskResult> {
   const timeoutMs = opts.timeoutMs ?? 300_000;
-  const settleMs = opts.settleMs ?? 4_000;
+  // Bots often acknowledge, pause, then start working, so idle must last a while before we call it done.
+  const settleMs = opts.settleMs ?? 12_000;
   const t0 = Date.now();
   const target = await openBot(cdp, botQuery);
   const sentKey = await sendToOpen(cdp, text);

@@ -70,7 +70,7 @@ grokbot read Chief             # recent messages in that conversation
 | `grokbot restore` | Restart Grok Bot normally, closing the port |
 | `grokbot mcp` | Run as an MCP server over stdio |
 
-Options: `--json` for machine-readable output, `--timeout <sec>` for `ask` (default 300), `--quiet` to stop progress lines on stderr. Pass `-` as the message to read it from stdin.
+Options: `--json` for machine-readable output, `--timeout <sec>` for `ask` (default 300), `--settle <sec>` for how long a Bot must stay idle before `ask` returns (default 12), `--quiet` to stop progress lines on stderr. Pass `-` as the message to read it from stdin.
 
 `ask` exits with code `2` if the Bot is still working when the timeout hits. Bots often acknowledge first and report back minutes later, so use `grokbot read <bot>` to collect the rest.
 

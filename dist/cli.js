@@ -295,7 +295,7 @@ async function send(cdp, botQuery, text) {
 }
 async function ask(cdp, botQuery, text, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 300000;
-  const settleMs = opts.settleMs ?? 4000;
+  const settleMs = opts.settleMs ?? 12000;
   const t0 = Date.now();
   const target = await openBot(cdp, botQuery);
   const sentKey = await sendToOpen(cdp, text);
@@ -358,7 +358,8 @@ var TOOLS = [
       properties: {
         bot: { type: "string", description: "Bot name (e.g. 'Chief') or id" },
         message: { type: "string", description: "The message to send, written like a request to a teammate" },
-        timeout_seconds: { type: "number", description: "Max seconds to wait for replies (default 300, max 1800)" }
+        timeout_seconds: { type: "number", description: "Max seconds to wait for replies (default 300, max 1800)" },
+        settle_seconds: { type: "number", description: "Idle seconds before the reply counts as finished (default 12)" }
       },
       required: ["bot", "message"],
       additionalProperties: false
@@ -412,7 +413,8 @@ async function callTool(name, args) {
       return withApp((c) => listBots(c));
     case "grokbot_ask": {
       const t = Math.min(Math.max(Number(args.timeout_seconds ?? 300), 10), 1800);
-      return withApp((c) => ask(c, str("bot"), str("message"), { timeoutMs: t * 1000 }));
+      const settle = Math.min(Math.max(Number(args.settle_seconds ?? 12), 2), 120);
+      return withApp((c) => ask(c, str("bot"), str("message"), { timeoutMs: t * 1000, settleMs: settle * 1000 }));
     }
     case "grokbot_send":
       return withApp((c) => send(c, str("bot"), str("message")));
@@ -484,6 +486,7 @@ Usage:
 
 Options:
   --timeout <sec>   ask: max seconds to wait (default 300)
+  --settle <sec>    ask: idle seconds before the reply counts as finished (default 12)
   --limit <n>       read: number of messages (default 10)
   --json            Machine-readable output
   --quiet           ask: don't stream progress to stderr
@@ -499,7 +502,7 @@ function parse(argv) {
     const a = argv[i];
     if (a === "--json" || a === "--quiet")
       flags[a.slice(2)] = true;
-    else if (a === "--timeout" || a === "--limit")
+    else if (a === "--timeout" || a === "--limit" || a === "--settle")
       flags[a.slice(2)] = argv[++i] ?? "";
     else if (a === "-h" || a === "--help")
       flags.help = true;
@@ -597,6 +600,7 @@ async function main() {
       const timeoutMs = positiveNumber(flags.timeout, "timeout", 300) * 1000;
       const r = await withApp2((c) => ask(c, bot, msg, {
         timeoutMs,
+        settleMs: positiveNumber(flags.settle, "settle", 12) * 1000,
         onUpdate: flags.quiet ? undefined : (m) => console.error(`[grokbot] ${m.role === "card" ? "card" : "reply"}: ${m.text.slice(0, 100).replace(/\s+/g, " ")}`)
       }));
       out(r, () => {

@@ -19,6 +19,7 @@ Usage:
 
 Options:
   --timeout <sec>   ask: max seconds to wait (default 300)
+  --settle <sec>    ask: idle seconds before the reply counts as finished (default 12)
   --limit <n>       read: number of messages (default 10)
   --json            Machine-readable output
   --quiet           ask: don't stream progress to stderr
@@ -34,7 +35,7 @@ function parse(argv: string[]) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--json" || a === "--quiet") flags[a.slice(2)] = true;
-    else if (a === "--timeout" || a === "--limit") flags[a.slice(2)] = argv[++i] ?? "";
+    else if (a === "--timeout" || a === "--limit" || a === "--settle") flags[a.slice(2)] = argv[++i] ?? "";
     else if (a === "-h" || a === "--help") flags.help = true;
     else if (a === "-v" || a === "--version") flags.version = true;
     else rest.push(a);
@@ -129,6 +130,7 @@ async function main() {
       const r = await withApp((c) =>
         ask(c, bot, msg, {
           timeoutMs,
+          settleMs: positiveNumber(flags.settle, "settle", 12) * 1000,
           onUpdate: flags.quiet
             ? undefined
             : (m) => console.error(`[grokbot] ${m.role === "card" ? "card" : "reply"}: ${m.text.slice(0, 100).replace(/\s+/g, " ")}`),
