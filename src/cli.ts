@@ -19,7 +19,7 @@ import {
 import { CDP, cdpPort, listTargets } from "./cdp.ts";
 import { serveMcp } from "./mcp.ts";
 import { createBot, deleteBot, updateBot } from "./roster.ts";
-import { addRoutine, changeRoutine, listRoutines, type Routine, type RoutineAction } from "./routines.ts";
+import { changeRoutine, listRoutines, type Routine, type RoutineChange, type RoutineChangeResult, runRoutine } from "./routines.ts";
 import { VERSION } from "./version.ts";
 
 const USAGE = `grokbot ${VERSION} — talk to your Grok Bots from the terminal or any agent
@@ -32,10 +32,11 @@ Usage:
   grokbot watch [bot]               Stream new replies and working/idle changes as JSON lines
   grokbot stop <bot>                Interrupt what the Bot is doing (like the Stop button)
   grokbot download <bot> [key...]   Save files from the conversation (default: the newest one the Bot sent)
-  grokbot routines <bot>            List the Bot's routines (scheduled and triggered prompts)
-  grokbot routines add <bot> --name <n> --schedule "<cron>" --prompt <text>   Add a scheduled routine
-  grokbot routines run|enable|disable <bot> <routine>   Run a routine now, or turn it on or off
-  grokbot routines remove <bot> <routine> --yes   Delete a routine (exact name or id)
+  grokbot routines <bot>            List the Bot's routines (needs its computer awake)
+  grokbot routines add <bot> --name <n> --schedule "<cron>" --prompt <text>   Ask the Bot to add a scheduled routine
+  grokbot routines enable|disable <bot> <routine>   Ask the Bot to turn a routine on or off
+  grokbot routines remove <bot> <routine> --yes   Ask the Bot to delete a routine (exact name or id)
+  grokbot routines run <bot> <routine>   Run a routine now (needs its computer awake)
   grokbot bots                      List your Bots and what each is doing
   grokbot create <name>             Create a Bot (--description <text>)
   grokbot update <bot>              Rename a Bot or change its description (--name, --description)
@@ -48,7 +49,7 @@ Usage:
 
 Options:
   --file <path>     ask/send: attach a file (repeat for several, 25 MB each)
-  --timeout <sec>   ask/wait: max seconds to wait (ask 300, wait 1800)
+  --timeout <sec>   ask/wait/routine changes: max seconds to wait (ask and routines 300, wait 1800)
   --settle <sec>    ask/wait/watch: idle seconds before a reply counts as finished (default 8)
   --since <key>     wait/read: messages after this message key (from send/ask/read --json)
   --limit <n>       read: number of messages (default 10)
@@ -65,7 +66,7 @@ Options:
   -h, --help        Show this help
 
 Use "-" as the message to read it from stdin.
-Exit codes for ask/wait: 0 finished, 2 still working at the timeout, 3 the Bot needs your input in the app.
+Exit codes for ask/wait and routine changes: 0 finished, 2 still working at the timeout, 3 the Bot needs your input in the app.\nRoutine changes are made by the Bot itself, so they work while Grok Bot is in the background; each is one short Bot turn.
 Env: GROKBOT_CDP_PORT (default 9333), GROKBOT_APP (path to the app)`;
 
 function parse(argv: string[]) {
@@ -143,6 +144,18 @@ function formatRoutine(r: Routine): string {
     ? ` · last run ${new Date(r.lastRun.at).toLocaleString()}${r.lastRun.status ? ` (${r.lastRun.status})` : ""}`
     : "";
   return `${r.name}  (${r.id})  [${r.enabled ? "on" : "off"}] ${r.trigger}${last}\n    ${r.prompt.replace(/\s+/g, " ").slice(0, 200)}`;
+}
+
+function printChange(r: RoutineChangeResult, done: string, json: boolean): void {
+  if (json) console.log(JSON.stringify(r, null, 2));
+  else if (r.ok) {
+    const x = r.routine;
+    const what = x?.name
+      ? `${x.name}${x.id ? ` (${x.id})` : ""}${x.schedule ? ` cron ${x.schedule}` : ""}${x.enabled === undefined ? "" : x.enabled ? " [on]" : " [off]"}`
+      : "the routine";
+    console.log(`${done} ${what} for ${r.bot}.`);
+  } else console.log(`${r.reply ? `${r.reply}\n\n` : ""}[grokbot] ${r.error}`);
+  if (!r.ok) process.exitCode = r.status === "needs_input" ? 3 : r.status === "timeout" ? 2 : 1;
 }
 
 async function withApp<T>(fn: (cdp: CDP) => Promise<T>): Promise<T> {
@@ -286,25 +299,30 @@ async function main() {
         const r = await withApp((c) => listRoutines(c, bot));
         return out(r, () => (r.routines.length ? r.routines.map(formatRoutine).join("\n") : `${r.bot} has no routines.`));
       }
+      const timing = {
+        timeoutMs: positiveNumber(flags.timeout, "timeout", 300) * 1000,
+        settleMs: positiveNumber(flags.settle, "settle", 8) * 1000,
+        onUpdate: flags.quiet ? undefined : progress,
+      };
       if (action === "add") {
         const name = str(flags.name);
         const schedule = str(flags.schedule);
         const prompt = str(flags.prompt) === "-" ? await readMessage(["-"]) : str(flags.prompt);
         if (!name || !schedule || !prompt)
           throw new Error('Usage: grokbot routines add <bot> --name <name> --schedule "<cron>" --prompt <text> [--disabled]');
-        const r = await withApp((c) => addRoutine(c, bot, { name, schedule, prompt, enabled: !flags.disabled }));
-        return out(r, () => (r.routine ? `Added to ${r.bot}:\n${formatRoutine(r.routine)}` : `Added "${name}" to ${r.bot}.`));
+        const r = await withApp((c) => changeRoutine(c, bot, "add", { name, schedule, prompt, enabled: !flags.disabled }, timing));
+        return printChange(r, "Added", !!flags.json);
       }
       const routine = rest.join(" ").trim();
       if (!routine) throw new Error(`Usage: grokbot routines ${action} <bot> <routine>${action === "remove" ? " --yes" : ""}`);
       if (action === "remove" && !flags.yes)
         throw new Error(`This permanently deletes the routine "${routine}". Run again with --yes to confirm.`);
-      const r = await withApp((c) => changeRoutine(c, bot, routine, action as RoutineAction));
-      const done = { run: "Started", enable: "Turned on", disable: "Turned off", remove: "Deleted" }[action as RoutineAction];
-      return out(
-        r,
-        () => `${done} ${r.routine.name} for ${r.bot}.${action === "run" ? ` Run \`grokbot wait ${r.bot}\` for the result.` : ""}`,
-      );
+      if (action === "run") {
+        const r = await withApp((c) => runRoutine(c, bot, routine));
+        return out(r, () => `Started ${r.routine.name} for ${r.bot}. Run \`grokbot wait ${r.bot}\` for the result.`);
+      }
+      const r = await withApp((c) => changeRoutine(c, bot, action as RoutineChange, routine, timing));
+      return printChange(r, { enable: "Turned on", disable: "Turned off", remove: "Deleted" }[action as "enable"], !!flags.json);
     }
     case "stop": {
       const bot = args.join(" ").trim();

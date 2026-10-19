@@ -18,10 +18,11 @@ grokbot read <bot> [--limit 10] [--since <key>] [--json]  # messages in that con
 grokbot watch [bot] --json                    # stream replies and working/idle/needs_input, one JSON line each
 grokbot stop <bot>                            # interrupt the Bot, like the Stop button
 grokbot download <bot> [key...] [--out <dir>]  # save files from the chat (default: newest the Bot sent)
-grokbot routines <bot> [--json]               # list the Bot's routines (scheduled prompts)
-grokbot routines add <bot> --name <n> --schedule "<cron>" --prompt "<text>" [--disabled]
-grokbot routines run|enable|disable <bot> <routine>
-grokbot routines remove <bot> <routine> --yes   # permanent; exact name or id
+grokbot routines <bot> [--json]               # list routines (needs the Bot's computer awake)
+grokbot routines add <bot> --name <n> --schedule "<cron>" --prompt "<text>" [--disabled]   # the Bot adds it
+grokbot routines enable|disable <bot> <routine>   # the Bot turns it on or off
+grokbot routines remove <bot> <routine> --yes   # the Bot deletes it; permanent; exact name or id
+grokbot routines run <bot> <routine>          # run now (needs the Bot's computer awake)
 grokbot create <name> [--description "<what it's for>"]   # new Bot
 grokbot update <bot> [--name <new>] [--description "<text>"]
 grokbot delete <bot> --yes                    # permanent; exact name or id
@@ -58,7 +59,8 @@ A routine is a saved prompt the Bot runs on a schedule, which is how recurring m
 - Add, enable or run a routine only when the user asked for that routine. Show them the name, schedule and prompt you used.
 - Write the prompt like any brief, including the boundary ("Research only…") and when to message the user ("only if something changed").
 - Delete a routine only when the user asked to delete that one.
-- If a change fails with "nobody is at this Mac" (`SAND_AWAY_PARK`), Grok Bot is keeping the Bot's computer asleep. Ask the user to bring the Grok Bot window to the front for about 15 seconds, then retry once. Messages still work. Don't retry in a loop.
+- Changes are made by the Bot with its own tools, so they work while Grok Bot is in the background. Each is one short Bot turn and exits like `ask`: `3` means the user must approve it in Grok Bot ("Allow <Bot> to save a routine?"). Tell them; they can choose *Always allow*.
+- `routines` (list) and `routines run` need the Bot's computer awake. When Grok Bot has put it to sleep (its window was in the background for 10 minutes), they fail with "computer is asleep". That's not an empty list. Don't retry in a loop, and never bring the Grok Bot window forward yourself. To check what exists, ask the Bot (`grokbot ask <bot> "List your routines"`).
 
 ## What to delegate
 

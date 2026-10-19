@@ -27,16 +27,19 @@ export function store(name: string, method: string): string {
 export const ACCOUNT_SLOT = `(${contextValue(`typeof v.accountSlot === "string"`)} || {}).accountSlot || null`;
 
 /**
- * Turns an app failure (which carries a code) or any thrown value into a readable message. Page-side.
- * Away-park: Grok Bot keeps the Bot's computer asleep while it thinks nobody is at this Mac, meaning
- * the screen is locked, the Mac is asleep, or the Grok Bot window has been unfocused for 10 minutes
- * with no input macOS counts (some virtual keyboards, such as Karabiner's, don't reset that count).
- * Messages still queue, but changes to the computer (routines, Bot settings) fail until then.
+ * Page-side expression for the app's Bot-computer phase: "settled" (awake), "connecting", "waking",
+ * "creating", "following", "asleep" or "away". Null if not found.
+ * Grok Bot puts the computer to sleep ("away") when the Mac is locked or asleep, or when the Grok Bot
+ * window has been in the background for 10 minutes; only bringing the window back wakes it. Bot turns
+ * (messages, routines on their schedule) still run in the cloud while it sleeps.
  */
+export const BOX_PHASE = `((${contextValue(`v.boxHostPhase && v.boxHostPhase.snapshots && typeof v.boxHostPhase.snapshots.get === "function"`)} || {}).boxHostPhase || { snapshots: { get: () => null } }).snapshots.get()`;
+
+/** Turns an app failure (which carries a code) or any thrown value into a readable message. Page-side. */
 export const PAGE_ERROR = `(e) => {
   const f = e && e.failure;
   if (f && f.code === "sand-box-blocked" && /PARK/.test(f.sandBoxBlockReason || ""))
-    return "Grok Bot is keeping the Bot's computer asleep because it thinks nobody is at this Mac (" + f.sandBoxBlockReason + "). Bring the Grok Bot window to the front, wait about 15 seconds, then try again.";
+    return "Grok Bot has put the Bot's computer to sleep because its window hasn't been in front for 10 minutes (" + f.sandBoxBlockReason + "). This change needs the computer, so it will work after you next open Grok Bot.";
   if (f && f.code) return f.code + (e.message && e.message !== f.code ? ": " + e.message : "");
   return String((e && e.message) || e);
 }`;
@@ -51,7 +54,7 @@ export const PAGE_AWAKE = `async (id, fn) => {
     await Promise.resolve(window.desktop?.main?.signalBoxIntent?.({ agentId: id, intent: "composer_focus" })).catch(() => {});
     try { return await fn(); } catch (e) {
       const f = e && e.failure;
-      // Away-park lasts until the user is back in Grok Bot, so retrying won't help.
+      // Away-park lasts until the Grok Bot window is in front again, so retrying won't help.
       if (i >= 8 || !(f && f.code === "sand-box-blocked") || f.sandBoxBlockReason === "SAND_AWAY_PARK") throw e;
       await new Promise((s) => setTimeout(s, 1500));
     }

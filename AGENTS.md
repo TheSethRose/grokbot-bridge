@@ -27,7 +27,7 @@
 - `src/cdp.ts`: minimal CDP client (`eval`, `call`, `bind` for page-to-CLI events).
 - `src/page.ts`: the only place that finds app internals (`store(name, method)`, `ACCOUNT_SLOT`), plus shared page-side helpers (`PAGE_ERROR`, `PAGE_AWAKE`).
 - `src/bot.ts`: Bot list, transcripts, send (with files), `wait`/`watch`, `stop`, `download`, `usage`.
-- `src/roster.ts`: create, update and delete Bots. `src/routines.ts`: routines. `src/app.ts`: finding, launching and restoring the app.
+- `src/roster.ts`: create, update and delete Bots. `src/routines.ts`: routines; changes are sent to the Bot as a message (it uses its own routine tools and ends with a `GROKBOT_RESULT` JSON line), list and run-now use the app store only while the computer is awake. Routines added through the app store didn't persist in testing, so don't move changes back there without re-testing. `src/app.ts`: finding, launching and restoring the app.
 - Code in template strings passed to `cdp.call` runs inside the app's renderer, not in Node. Write plain JavaScript there, escape backslashes (`\\`) in regexes, and pass data as arguments instead of interpolating it.
 - Long page-side waits are driven by the CLI's one-second heartbeat (`withHeartbeat` in `src/bot.ts`), because the app throttles window timers in the background. Don't rely on `setTimeout`/`setInterval` timing in page code.
 - To investigate a new app version, extract `/Applications/Grok Bot.app/Contents/Resources/app.asar` into a temporary directory and probe the live window over CDP. Never commit extracted app code.
@@ -36,7 +36,7 @@
 
 - Live tests act on the user's real account: messages land in their Bot's history and use their weekly Grok Bot usage. Keep test messages short, labelled as tests, and research-only. Delete only the test routines or Bots you created yourself.
 - Never answer a Bot's approval cards or questions programmatically; report `needs_input` to the user.
-- `SAND_AWAY_PARK` means Grok Bot thinks nobody is at the Mac: screen locked, Mac asleep, or its window unfocused for 10 minutes with no input in macOS's idle count (`HIDIdleTime`, which Karabiner's virtual keyboard doesn't reset). Don't fake presence or focus the window yourself; ask the user to bring Grok Bot to the front, then retry.
+- `SAND_AWAY_PARK` (phase `away`, read via `BOX_PHASE` in `src/page.ts`) means Grok Bot put the Bot's computer to sleep: Mac locked or asleep, or the Grok Bot window in the background for 10 minutes. Only window focus wakes it; input elsewhere doesn't. Never focus or activate the window, synthesize input or patch presence. Route work through the Bot (as routine changes do) or report that the computer is asleep.
 - Don't print or log the account slot, cookies or other identifiers read from the app beyond what a command needs.
 - Keep `delete` and `routines remove` behind `--yes` (CLI) and `confirm` (MCP), with exact-name matching.
 

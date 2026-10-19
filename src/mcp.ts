@@ -5,7 +5,7 @@ import { launch } from "./app.ts";
 import { ask, download, listBots, read, send, stop, usage, wait } from "./bot.ts";
 import { CDP } from "./cdp.ts";
 import { createBot, deleteBot, updateBot } from "./roster.ts";
-import { addRoutine, changeRoutine, listRoutines, type RoutineAction } from "./routines.ts";
+import { changeRoutine, listRoutines, type RoutineChange, runRoutine } from "./routines.ts";
 import { VERSION } from "./version.ts";
 
 const TOOLS = [
@@ -87,7 +87,7 @@ const TOOLS = [
   {
     name: "grokbot_routines",
     description:
-      "Manage a Grok Bot's routines (prompts it runs on a schedule). action 'list' shows them; 'add' needs name, schedule (5-field cron) and prompt; 'run', 'enable', 'disable' and 'remove' need routine (name or id; remove needs the exact name or id and confirm repeating it). Running or enabling a routine uses the user's Grok Bot usage, so only change routines when the user asked.",
+      "Manage a Grok Bot's routines (prompts it runs on a schedule). 'add', 'enable', 'disable' and 'remove' ask the Bot to make the change with its own tools, so they work while Grok Bot is in the background; each is one short Bot turn and returns ok, the routine, the Bot's reply and its status ('needs_input' means the user must approve the change in Grok Bot). 'list' and 'run' read the app directly and fail with an 'asleep' error while Grok Bot has put the Bot's computer to sleep; don't retry those in a loop. 'add' needs name, schedule (5-field cron) and prompt; the others need routine (name or id; remove needs the exact name or id and confirm repeating it). Routines use the user's Grok Bot usage, so only change them when the user asked.",
     inputSchema: {
       type: "object",
       properties: {
@@ -99,6 +99,7 @@ const TOOLS = [
         schedule: { type: "string", description: "add: cron schedule, e.g. '0 9 * * 1-5'" },
         prompt: { type: "string", description: "add: what the Bot does each run" },
         enabled: { type: "boolean", description: "add: start turned on (default true)" },
+        timeout_seconds: { type: "number", description: "add/enable/disable/remove: max seconds to wait for the Bot (default 300)" },
       },
       required: ["action", "bot"],
       additionalProperties: false,
@@ -223,19 +224,16 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     case "grokbot_routines": {
       const action = str("action");
       if (action === "list") return withApp((c) => listRoutines(c, str("bot")));
+      if (action === "run") return withApp((c) => runRoutine(c, str("bot"), str("routine")));
+      const timeoutSeconds = Number(args.timeout_seconds);
+      const timing = { timeoutMs: (Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds : 300) * 1000 };
       if (action === "add") {
-        return withApp((c) =>
-          addRoutine(c, str("bot"), {
-            name: str("name"),
-            schedule: str("schedule"),
-            prompt: str("prompt"),
-            enabled: args.enabled !== false,
-          }),
-        );
+        const spec = { name: str("name"), schedule: str("schedule"), prompt: str("prompt"), enabled: args.enabled !== false };
+        return withApp((c) => changeRoutine(c, str("bot"), "add", spec, timing));
       }
-      if (!["run", "enable", "disable", "remove"].includes(action)) throw new Error(`Unknown action "${action}".`);
+      if (!["enable", "disable", "remove"].includes(action)) throw new Error(`Unknown action "${action}".`);
       if (action === "remove" && str("confirm") !== str("routine")) throw new Error('"confirm" must repeat the "routine" value exactly.');
-      return withApp((c) => changeRoutine(c, str("bot"), str("routine"), action as RoutineAction));
+      return withApp((c) => changeRoutine(c, str("bot"), action as RoutineChange, str("routine"), timing));
     }
     case "grokbot_stop":
       return withApp((c) => stop(c, str("bot")));

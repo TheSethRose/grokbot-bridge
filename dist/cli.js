@@ -201,10 +201,11 @@ function store(name, method) {
   return `(${contextValue(`v[${n}] && typeof v[${n}][${JSON.stringify(method)}] === "function"`)} || {})[${n}] || null`;
 }
 var ACCOUNT_SLOT = `(${contextValue(`typeof v.accountSlot === "string"`)} || {}).accountSlot || null`;
+var BOX_PHASE = `((${contextValue(`v.boxHostPhase && v.boxHostPhase.snapshots && typeof v.boxHostPhase.snapshots.get === "function"`)} || {}).boxHostPhase || { snapshots: { get: () => null } }).snapshots.get()`;
 var PAGE_ERROR = `(e) => {
   const f = e && e.failure;
   if (f && f.code === "sand-box-blocked" && /PARK/.test(f.sandBoxBlockReason || ""))
-    return "Grok Bot is keeping the Bot's computer asleep because it thinks nobody is at this Mac (" + f.sandBoxBlockReason + "). Bring the Grok Bot window to the front, wait about 15 seconds, then try again.";
+    return "Grok Bot has put the Bot's computer to sleep because its window hasn't been in front for 10 minutes (" + f.sandBoxBlockReason + "). This change needs the computer, so it will work after you next open Grok Bot.";
   if (f && f.code) return f.code + (e.message && e.message !== f.code ? ": " + e.message : "");
   return String((e && e.message) || e);
 }`;
@@ -213,7 +214,7 @@ var PAGE_AWAKE = `async (id, fn) => {
     await Promise.resolve(window.desktop?.main?.signalBoxIntent?.({ agentId: id, intent: "composer_focus" })).catch(() => {});
     try { return await fn(); } catch (e) {
       const f = e && e.failure;
-      // Away-park lasts until the user is back in Grok Bot, so retrying won't help.
+      // Away-park lasts until the Grok Bot window is in front again, so retrying won't help.
       if (i >= 8 || !(f && f.code === "sand-box-blocked") || f.sandBoxBlockReason === "SAND_AWAY_PARK") throw e;
       await new Promise((s) => setTimeout(s, 1500));
     }
@@ -669,10 +670,11 @@ async function deleteBot(cdp, query) {
 
 // src/routines.ts
 var PAGE_ROUTINES = `async (op, id, arg) => {
+  const phase = ${BOX_PHASE};
+  if (phase !== "settled") return { asleep: phase || "unknown" };
   const routines = ${store("automations", "snapshotsFor")};
   if (!routines) return { error: "Couldn't reach Grok Bot's routines. This app version may not support them." };
   const errorText = ${PAGE_ERROR};
-  const awake = ${PAGE_AWAKE};
   const iso = (ms) => (typeof ms === "number" && ms > 0 ? new Date(ms).toISOString() : typeof ms === "string" ? ms : null);
   const trigger = (t) => !t ? "" : t.type === "cron" ? "cron " + t.schedule : t.type === "group" ? (t.listeners || []).map(trigger).join(" + ") : t.type;
   const toRoutine = (a) => {
@@ -687,85 +689,130 @@ var PAGE_ROUTINES = `async (op, id, arg) => {
   const snaps = routines.snapshotsFor(id);
   const unsubscribe = snaps.subscribe(() => {});
   const installed = () => { const s = snaps.get() || {}; return s.installed ?? (s.value && s.value.installed) ?? (Array.isArray(s.value) ? s.value : []); };
-  const load = async () => {
+  try {
     routines.refresh(id);
     for (const t0 = Date.now(); ; await new Promise((r) => setTimeout(r, 200))) {
       const s = snaps.get() || {};
       if (s.status !== "loading" && s.status !== "idle") {
         if (s.status === "failed") throw new Error("Couldn't load routines: " + errorText(s.failure || s.error || "failed"));
-        return;
+        break;
       }
       if (Date.now() - t0 > 20000) throw new Error("Timed out loading routines.");
     }
-  };
-  try {
-    await load();
+    // The computer can fall asleep while loading, which also reads as no routines.
+    if (${BOX_PHASE} !== "settled") return { asleep: ${BOX_PHASE} || "unknown" };
     if (op === "list") return { value: installed().map(toRoutine) };
-    if (op === "add") {
-      const before = new Set(installed().map((a) => a.id));
-      const res = await awake(id, () => routines.create(id, arg));
-      await load();
-      const added = installed().find((a) => !before.has(a.id)) || (res && res.id ? res : null);
-      return { value: added ? toRoutine(added) : null };
+    if (op === "run") {
+      const target = installed().find((a) => a.id === arg);
+      if (!target) return { error: "That routine is gone." };
+      await routines.runNow(id, target.id);
+      return { value: toRoutine(target) };
     }
-    const target = installed().find((a) => a.id === arg.routine);
-    if (!target) return { error: "That routine is gone." };
-    if (op === "run") await awake(id, () => routines.runNow(id, target.id));
-    else if (op === "enable" || op === "disable") await awake(id, () => routines.setEnabled(id, target.id, op === "enable"));
-    else if (op === "remove") await awake(id, () => routines.remove(id, target.id));
-    else return { error: "Unknown routines operation " + op };
-    await load();
-    const now = installed().find((a) => a.id === target.id);
-    return { value: now ? toRoutine(now) : { ...toRoutine(target), removed: true } };
+    return { error: "Unknown routines operation " + op };
   } catch (e) {
     return { error: errorText(e) };
   } finally {
     unsubscribe();
   }
 }`;
-async function op2(cdp, name, botId, arg) {
-  const r = await cdp.call(PAGE_ROUTINES, name, botId, arg ?? null);
+function asleepMessage(bot, phase) {
+  return `${bot}'s computer is asleep (Grok Bot phase "${phase}"), so Grok Bot can't show its routines right now. It wakes the next time you open Grok Bot. Routine changes still work: they go through the Bot.`;
+}
+async function pageOp(cdp, op2, bot, arg) {
+  const r = await cdp.call(PAGE_ROUTINES, op2, bot.id, arg ?? null);
+  if (r.asleep !== undefined) {
+    throw new Error(op2 === "run" ? `${bot.name}'s computer is asleep, and Bots can't start a routine on demand. It will run on its schedule, or run this again after you next open Grok Bot.` : asleepMessage(bot.name, r.asleep));
+  }
   if (r.error !== undefined)
     throw new Error(r.error);
   return r.value;
 }
 async function listRoutines(cdp, botQuery) {
   const bot = await findBot(cdp, botQuery);
-  return { bot: bot.name, routines: await op2(cdp, "list", bot.id) };
+  return { bot: bot.name, routines: await pageOp(cdp, "list", bot) };
 }
-function matchRoutine(routines, query, exact) {
+function matchRoutine(routines, query) {
   const q = query.trim().toLowerCase();
   const hits = routines.filter((r) => r.id === query.trim() || r.name.toLowerCase() === q);
   if (hits.length === 1)
     return hits[0];
-  const partial = exact || hits.length ? [] : routines.filter((r) => r.name.toLowerCase().startsWith(q));
+  const partial = hits.length ? [] : routines.filter((r) => r.name.toLowerCase().startsWith(q));
   if (partial.length === 1)
     return partial[0];
   const names = routines.map((r) => `${r.name} (${r.id})`).join(", ") || "none";
   throw new Error(hits.length + partial.length > 1 ? `"${query}" matches several routines. Use the id: ${names}` : `No routine "${query}". Routines: ${names}`);
 }
-async function addRoutine(cdp, botQuery, spec) {
-  const name = spec.name.trim();
-  const prompt = spec.prompt.trim();
-  const schedule = spec.schedule.trim();
-  if (!name || !prompt || !schedule)
-    throw new Error("A routine needs a name, a prompt and a schedule.");
-  if (schedule.split(/\s+/).length !== 5)
-    throw new Error(`"${schedule}" isn't a 5-field cron schedule, e.g. "0 9 * * 1-5".`);
+async function runRoutine(cdp, botQuery, routineQuery) {
   const bot = await findBot(cdp, botQuery);
-  const routine = await op2(cdp, "add", bot.id, {
-    name,
-    prompt,
-    trigger: { type: "cron", schedule },
-    isEnabled: spec.enabled !== false
-  });
-  return { bot: bot.name, routine };
+  const target = matchRoutine(await pageOp(cdp, "list", bot), routineQuery);
+  return { bot: bot.name, routine: await pageOp(cdp, "run", bot, target.id) };
 }
-async function changeRoutine(cdp, botQuery, routineQuery, action) {
-  const { bot, routines } = await listRoutines(cdp, botQuery);
-  const target = matchRoutine(routines, routineQuery, action === "remove");
-  const botId = (await findBot(cdp, bot)).id;
-  return { bot, routine: await op2(cdp, action, botId, { routine: target.id }) };
+var RESULT_TAG = "GROKBOT_RESULT";
+function instruction(change, target) {
+  const q = (s) => JSON.stringify(s);
+  const match = (s) => `the routine whose id or name is exactly ${q(s)} (name match ignores case). If no routine or more than one matches, change nothing and say so`;
+  if (change === "add") {
+    const s = target;
+    return [
+      "Create a routine with these exact settings:",
+      `- Name: ${q(s.name)}`,
+      `- Schedule (cron): ${q(s.schedule)}`,
+      `- State: ${s.enabled === false ? "paused" : "active"}`,
+      `- Prompt, used word for word: ${q(s.prompt)}`
+    ].join(`
+`);
+  }
+  const verb = { enable: "Resume (turn on)", disable: "Pause (turn off)", remove: "Delete" }[change];
+  return `${verb} ${match(target)}.`;
+}
+function parseResult(messages) {
+  const text = messages.filter((m) => m.role === "assistant" && m.text).map((m) => m.text).join(`
+`);
+  let result = null;
+  const lines = text.split(`
+`);
+  for (const line of lines) {
+    const at = line.indexOf(RESULT_TAG);
+    if (at < 0)
+      continue;
+    try {
+      const v = JSON.parse(line.slice(at + RESULT_TAG.length).trim().replace(/^`+|`+$/g, ""));
+      if (v && typeof v === "object")
+        result = v;
+    } catch {}
+  }
+  return {
+    result,
+    reply: lines.filter((l) => !l.includes(RESULT_TAG)).join(`
+`).trim()
+  };
+}
+async function changeRoutine(cdp, botQuery, change, target, opts = {}) {
+  if (change === "add") {
+    const s = target;
+    const spec = { ...s, name: s.name.trim(), prompt: s.prompt.trim(), schedule: s.schedule.trim() };
+    if (!spec.name || !spec.prompt || !spec.schedule)
+      throw new Error("A routine needs a name, a prompt and a schedule.");
+    if (spec.schedule.split(/\s+/).length !== 5)
+      throw new Error(`"${spec.schedule}" isn't a 5-field cron schedule, e.g. "0 9 * * 1-5".`);
+    target = spec;
+  } else if (!target.trim()) {
+    throw new Error("Which routine? Give its name or id.");
+  }
+  const message = [
+    "Request from grokbot, the command-line tool the user runs on their Mac. Use your routine tools and change nothing else.",
+    "",
+    instruction(change, target),
+    "",
+    `When you're done, end your reply with exactly one line: ${RESULT_TAG} followed by JSON, either {"ok":true,"routine":{"id":"…","name":"…","schedule":"…","enabled":true}} or {"ok":false,"error":"what went wrong"}.`
+  ].join(`
+`);
+  const r = await ask(cdp, botQuery, message, { timeoutMs: 300000, ...opts });
+  const { result, reply } = parseResult(r.messages);
+  const routine = result && typeof result.routine === "object" ? result.routine : null;
+  const ok = r.status === "done" && result?.ok === true;
+  const error = ok ? null : typeof result?.error === "string" ? result.error : r.status === "needs_input" ? `${r.bot} is waiting for you to approve the change in Grok Bot.` : r.status === "timeout" ? `${r.bot} hasn't finished yet. Run \`grokbot wait ${r.bot}\` to see its reply.` : `${r.bot} didn't confirm the change. Check its reply.`;
+  return { bot: r.bot, status: r.status, ok, routine, error, reply, key: r.key };
 }
 
 // src/version.ts
@@ -844,7 +891,7 @@ var TOOLS = [
   },
   {
     name: "grokbot_routines",
-    description: "Manage a Grok Bot's routines (prompts it runs on a schedule). action 'list' shows them; 'add' needs name, schedule (5-field cron) and prompt; 'run', 'enable', 'disable' and 'remove' need routine (name or id; remove needs the exact name or id and confirm repeating it). Running or enabling a routine uses the user's Grok Bot usage, so only change routines when the user asked.",
+    description: "Manage a Grok Bot's routines (prompts it runs on a schedule). 'add', 'enable', 'disable' and 'remove' ask the Bot to make the change with its own tools, so they work while Grok Bot is in the background; each is one short Bot turn and returns ok, the routine, the Bot's reply and its status ('needs_input' means the user must approve the change in Grok Bot). 'list' and 'run' read the app directly and fail with an 'asleep' error while Grok Bot has put the Bot's computer to sleep; don't retry those in a loop. 'add' needs name, schedule (5-field cron) and prompt; the others need routine (name or id; remove needs the exact name or id and confirm repeating it). Routines use the user's Grok Bot usage, so only change them when the user asked.",
     inputSchema: {
       type: "object",
       properties: {
@@ -855,7 +902,8 @@ var TOOLS = [
         name: { type: "string", description: "add: routine name" },
         schedule: { type: "string", description: "add: cron schedule, e.g. '0 9 * * 1-5'" },
         prompt: { type: "string", description: "add: what the Bot does each run" },
-        enabled: { type: "boolean", description: "add: start turned on (default true)" }
+        enabled: { type: "boolean", description: "add: start turned on (default true)" },
+        timeout_seconds: { type: "number", description: "add/enable/disable/remove: max seconds to wait for the Bot (default 300)" }
       },
       required: ["action", "bot"],
       additionalProperties: false
@@ -969,19 +1017,19 @@ async function callTool(name, args) {
       const action = str("action");
       if (action === "list")
         return withApp((c) => listRoutines(c, str("bot")));
+      if (action === "run")
+        return withApp((c) => runRoutine(c, str("bot"), str("routine")));
+      const timeoutSeconds = Number(args.timeout_seconds);
+      const timing = { timeoutMs: (Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds : 300) * 1000 };
       if (action === "add") {
-        return withApp((c) => addRoutine(c, str("bot"), {
-          name: str("name"),
-          schedule: str("schedule"),
-          prompt: str("prompt"),
-          enabled: args.enabled !== false
-        }));
+        const spec = { name: str("name"), schedule: str("schedule"), prompt: str("prompt"), enabled: args.enabled !== false };
+        return withApp((c) => changeRoutine(c, str("bot"), "add", spec, timing));
       }
-      if (!["run", "enable", "disable", "remove"].includes(action))
+      if (!["enable", "disable", "remove"].includes(action))
         throw new Error(`Unknown action "${action}".`);
       if (action === "remove" && str("confirm") !== str("routine"))
         throw new Error('"confirm" must repeat the "routine" value exactly.');
-      return withApp((c) => changeRoutine(c, str("bot"), str("routine"), action));
+      return withApp((c) => changeRoutine(c, str("bot"), action, str("routine"), timing));
     }
     case "grokbot_stop":
       return withApp((c) => stop(c, str("bot")));
@@ -1064,10 +1112,11 @@ Usage:
   grokbot watch [bot]               Stream new replies and working/idle changes as JSON lines
   grokbot stop <bot>                Interrupt what the Bot is doing (like the Stop button)
   grokbot download <bot> [key...]   Save files from the conversation (default: the newest one the Bot sent)
-  grokbot routines <bot>            List the Bot's routines (scheduled and triggered prompts)
-  grokbot routines add <bot> --name <n> --schedule "<cron>" --prompt <text>   Add a scheduled routine
-  grokbot routines run|enable|disable <bot> <routine>   Run a routine now, or turn it on or off
-  grokbot routines remove <bot> <routine> --yes   Delete a routine (exact name or id)
+  grokbot routines <bot>            List the Bot's routines (needs its computer awake)
+  grokbot routines add <bot> --name <n> --schedule "<cron>" --prompt <text>   Ask the Bot to add a scheduled routine
+  grokbot routines enable|disable <bot> <routine>   Ask the Bot to turn a routine on or off
+  grokbot routines remove <bot> <routine> --yes   Ask the Bot to delete a routine (exact name or id)
+  grokbot routines run <bot> <routine>   Run a routine now (needs its computer awake)
   grokbot bots                      List your Bots and what each is doing
   grokbot create <name>             Create a Bot (--description <text>)
   grokbot update <bot>              Rename a Bot or change its description (--name, --description)
@@ -1080,7 +1129,7 @@ Usage:
 
 Options:
   --file <path>     ask/send: attach a file (repeat for several, 25 MB each)
-  --timeout <sec>   ask/wait: max seconds to wait (ask 300, wait 1800)
+  --timeout <sec>   ask/wait/routine changes: max seconds to wait (ask and routines 300, wait 1800)
   --settle <sec>    ask/wait/watch: idle seconds before a reply counts as finished (default 8)
   --since <key>     wait/read: messages after this message key (from send/ask/read --json)
   --limit <n>       read: number of messages (default 10)
@@ -1097,7 +1146,8 @@ Options:
   -h, --help        Show this help
 
 Use "-" as the message to read it from stdin.
-Exit codes for ask/wait: 0 finished, 2 still working at the timeout, 3 the Bot needs your input in the app.
+Exit codes for ask/wait and routine changes: 0 finished, 2 still working at the timeout, 3 the Bot needs your input in the app.
+Routine changes are made by the Bot itself, so they work while Grok Bot is in the background; each is one short Bot turn.
 Env: GROKBOT_CDP_PORT (default 9333), GROKBOT_APP (path to the app)`;
 function parse(argv) {
   const flags = {};
@@ -1176,6 +1226,20 @@ function formatRoutine(r) {
   const last = r.lastRun?.at ? ` · last run ${new Date(r.lastRun.at).toLocaleString()}${r.lastRun.status ? ` (${r.lastRun.status})` : ""}` : "";
   return `${r.name}  (${r.id})  [${r.enabled ? "on" : "off"}] ${r.trigger}${last}
     ${r.prompt.replace(/\s+/g, " ").slice(0, 200)}`;
+}
+function printChange(r, done, json) {
+  if (json)
+    console.log(JSON.stringify(r, null, 2));
+  else if (r.ok) {
+    const x = r.routine;
+    const what = x?.name ? `${x.name}${x.id ? ` (${x.id})` : ""}${x.schedule ? ` cron ${x.schedule}` : ""}${x.enabled === undefined ? "" : x.enabled ? " [on]" : " [off]"}` : "the routine";
+    console.log(`${done} ${what} for ${r.bot}.`);
+  } else
+    console.log(`${r.reply ? `${r.reply}
+
+` : ""}[grokbot] ${r.error}`);
+  if (!r.ok)
+    process.exitCode = r.status === "needs_input" ? 3 : r.status === "timeout" ? 2 : 1;
 }
 async function withApp2(fn) {
   const { restarted } = await launch();
@@ -1319,24 +1383,31 @@ ${formatUsage(s.usage)}` : ""}`);
         return out(r2, () => r2.routines.length ? r2.routines.map(formatRoutine).join(`
 `) : `${r2.bot} has no routines.`);
       }
+      const timing = {
+        timeoutMs: positiveNumber(flags.timeout, "timeout", 300) * 1000,
+        settleMs: positiveNumber(flags.settle, "settle", 8) * 1000,
+        onUpdate: flags.quiet ? undefined : progress
+      };
       if (action === "add") {
         const name = str(flags.name);
         const schedule = str(flags.schedule);
         const prompt = str(flags.prompt) === "-" ? await readMessage(["-"]) : str(flags.prompt);
         if (!name || !schedule || !prompt)
           throw new Error('Usage: grokbot routines add <bot> --name <name> --schedule "<cron>" --prompt <text> [--disabled]');
-        const r2 = await withApp2((c) => addRoutine(c, bot, { name, schedule, prompt, enabled: !flags.disabled }));
-        return out(r2, () => r2.routine ? `Added to ${r2.bot}:
-${formatRoutine(r2.routine)}` : `Added "${name}" to ${r2.bot}.`);
+        const r2 = await withApp2((c) => changeRoutine(c, bot, "add", { name, schedule, prompt, enabled: !flags.disabled }, timing));
+        return printChange(r2, "Added", !!flags.json);
       }
       const routine = rest.join(" ").trim();
       if (!routine)
         throw new Error(`Usage: grokbot routines ${action} <bot> <routine>${action === "remove" ? " --yes" : ""}`);
       if (action === "remove" && !flags.yes)
         throw new Error(`This permanently deletes the routine "${routine}". Run again with --yes to confirm.`);
-      const r = await withApp2((c) => changeRoutine(c, bot, routine, action));
-      const done = { run: "Started", enable: "Turned on", disable: "Turned off", remove: "Deleted" }[action];
-      return out(r, () => `${done} ${r.routine.name} for ${r.bot}.${action === "run" ? ` Run \`grokbot wait ${r.bot}\` for the result.` : ""}`);
+      if (action === "run") {
+        const r2 = await withApp2((c) => runRoutine(c, bot, routine));
+        return out(r2, () => `Started ${r2.routine.name} for ${r2.bot}. Run \`grokbot wait ${r2.bot}\` for the result.`);
+      }
+      const r = await withApp2((c) => changeRoutine(c, bot, action, routine, timing));
+      return printChange(r, { enable: "Turned on", disable: "Turned off", remove: "Deleted" }[action], !!flags.json);
     }
     case "stop": {
       const bot = args.join(" ").trim();
