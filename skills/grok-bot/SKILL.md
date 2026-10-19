@@ -1,11 +1,11 @@
 ---
 name: grok-bot
-description: Delegate work to the user's Grok Bots (xAI's always-on agents with their own cloud computer and browser) through the `grokbot` CLI or MCP tools — research on X and the web, monitoring, long multi-step browser tasks, and anything the Bot's connected apps can do. Use when the user mentions Grok Bot or one of their Bots by name (e.g. Chief), wants X/Twitter data, or wants work that keeps running in the cloud after this session ends.
+description: Delegate work to the user's Grok Bots (xAI's always-on agents with their own cloud computer and browser) through the `grokbot` CLI or MCP tools — research on X and the web, scheduled monitoring routines, long multi-step browser tasks, files in and out, and anything the Bot's connected apps can do. Use when the user mentions Grok Bot or one of their Bots by name (e.g. Chief), wants X/Twitter data, or wants work that keeps running in the cloud after this session ends.
 ---
 
 # Grok Bot
 
-The user's Grok Bots are always-on agents in xAI's Grok Bot desktop app. Each Bot works on a persistent cloud computer with a browser, terminal and the user's connected apps, and it keeps working when this session ends. `grokbot` (from [grokbot-bridge](https://github.com/TheSethRose/grokbot-bridge)) lets you message a Bot and read its replies by driving the user's desktop app locally.
+The user's Grok Bots are always-on agents in xAI's Grok Bot desktop app. Each Bot works on a persistent cloud computer with a browser, terminal and the user's connected apps, and it keeps working when this session ends. `grokbot` (from [grokbot-bridge](https://github.com/TheSethRose/grokbot-bridge)) lets you message a Bot, wait for and read its replies, exchange files and manage its routines by driving the user's desktop app locally.
 
 ## Commands
 
@@ -17,6 +17,11 @@ grokbot wait <bot> [--since <key>] [--timeout 1800] [--json]   # wait for the re
 grokbot read <bot> [--limit 10] [--since <key>] [--json]  # messages in that conversation
 grokbot watch [bot] --json                    # stream replies and working/idle/needs_input, one JSON line each
 grokbot stop <bot>                            # interrupt the Bot, like the Stop button
+grokbot download <bot> [key...] [--out <dir>]  # save files from the chat (default: newest the Bot sent)
+grokbot routines <bot> [--json]               # list the Bot's routines (scheduled prompts)
+grokbot routines add <bot> --name <n> --schedule "<cron>" --prompt "<text>" [--disabled]
+grokbot routines run|enable|disable <bot> <routine>
+grokbot routines remove <bot> <routine> --yes   # permanent; exact name or id
 grokbot create <name> [--description "<what it's for>"]   # new Bot
 grokbot update <bot> [--name <new>] [--description "<text>"]
 grokbot delete <bot> --yes                    # permanent; exact name or id
@@ -24,7 +29,7 @@ grokbot usage [--json]                        # weekly usage limit: % used, rese
 grokbot status                                # connection check (includes usage)
 ```
 
-The same actions are available as MCP tools: `grokbot_list_bots`, `grokbot_ask`, `grokbot_send`, `grokbot_wait`, `grokbot_read`, `grokbot_stop`, `grokbot_usage`, `grokbot_create_bot`, `grokbot_update_bot`, `grokbot_delete_bot`. Use `-` as the message to read it from stdin, which is handy for long briefs. `--file` (repeatable, 25 MB each) attaches local files such as a brief, a CSV or a screenshot.
+The same actions are available as MCP tools: `grokbot_list_bots`, `grokbot_ask`, `grokbot_send`, `grokbot_wait`, `grokbot_read`, `grokbot_stop`, `grokbot_download`, `grokbot_routines`, `grokbot_usage`, `grokbot_create_bot`, `grokbot_update_bot`, `grokbot_delete_bot`. Use `-` as the message to read it from stdin, which is handy for long briefs. `--file` (repeatable, 25 MB each) attaches local files such as a brief, a CSV or a screenshot.
 
 - The first call may restart the Grok Bot app with a loopback-only debug port (`grokbot launch`). Cloud work isn't interrupted, but tell the user the first time it happens. `grokbot restore` restarts the app normally.
 - `ask` and `wait` exit `0` when the Bot has finished, `2` if it's still working at the timeout, and `3` if it's waiting for the user in the app (an approval card or a question). On `3`, tell the user what the Bot is waiting for; don't answer it yourself. Bots often acknowledge first ("On it, I'll report back") and then keep working, so a reply that's only an acknowledgment means: wait again. Don't resend the request.
@@ -41,13 +46,27 @@ Never `sleep` and re-check. `wait` is event-driven and returns the moment the Bo
 
 If a task is running away (wrong direction, burning usage), `grokbot stop <bot>` interrupts it. Only stop a Bot when the user asked you to, or when it's doing work you started and clearly went wrong; say that you did.
 
+## Files
+
+- **To the Bot:** `--file <path>` on `ask` or `send`.
+- **From the Bot:** in `read --json` or `wait --json` output, file messages have a `file` field. `grokbot download <bot> <key> --out <dir>` saves them; with no key it saves the newest file the Bot sent. It never overwrites, so check the printed path. Ask the Bot to "send the file as an attachment in this chat" when you need its output as a file.
+
+## Routines
+
+A routine is a saved prompt the Bot runs on a schedule, which is how recurring monitoring works. `routines add` takes a 5-field cron schedule (`"0 9 * * 1-5"` is 9:00 on weekdays). Each run uses the user's Grok Bot usage, so:
+
+- Add, enable or run a routine only when the user asked for that routine. Show them the name, schedule and prompt you used.
+- Write the prompt like any brief, including the boundary ("Research only…") and when to message the user ("only if something changed").
+- Delete a routine only when the user asked to delete that one.
+- If a change fails with "nobody is using this Mac" (`SAND_AWAY_PARK`), Grok Bot has paused the Bot's computer until the user is back. Messages still work. Tell the user, and don't retry in a loop.
+
 ## What to delegate
 
 Give the Bot work that needs its own computer or that should keep going without you:
 
 - **X and web research:** "Find 5 posts from the last week showing X, with links, authors and dates." Bots can browse X directly with the user's connected account.
 - **Long browser tasks:** filling portals, comparing products, collecting data across many sites, following up on a page later.
-- **Monitoring:** "Check this every morning and message me if it changes." Bots can turn a stable task into a routine.
+- **Monitoring:** "Check this every morning and message me if it changes." Bots can turn a stable task into a routine (see Routines).
 - **Connected apps:** email, calendar, Slack and other connectors the user has granted the Bot.
 
 Bot work counts against the user's weekly usage limit. Run `grokbot usage` before a long or recurring job and again after it, and tell the user what it cost (for example "1.4% → 3.0%"). If usage is above about 80%, or the limit is reached, ask before starting more Bot work.

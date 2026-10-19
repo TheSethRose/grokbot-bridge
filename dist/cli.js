@@ -180,23 +180,45 @@ async function restore() {
 }
 
 // src/bot.ts
-import { readFile, stat } from "node:fs/promises";
-import { basename } from "node:path";
+import { mkdir, open as openFile, readFile, stat } from "node:fs/promises";
+import { basename, extname, join as join2, resolve } from "node:path";
 
 // src/page.ts
-function store(name, method) {
+function contextValue(test) {
   return `(() => {
     for (const start of [document.querySelector(".sand-agent-item[data-agent-id]"), document.querySelector("button")]) {
       const key = start && Object.keys(start).find((k) => k.startsWith("__reactFiber"));
       for (let f = key ? start[key] : null; f; f = f.return) {
-        const s = f.memoizedProps && f.memoizedProps.value && f.memoizedProps.value[${JSON.stringify(name)}];
-        if (s && typeof s[${JSON.stringify(method)}] === "function") return s;
+        const v = f.memoizedProps && f.memoizedProps.value;
+        if (v && typeof v === "object" && (${test})) return v;
       }
     }
     return null;
   })()`;
 }
-var PAGE_ERROR = `(e) => (e && e.failure && e.failure.code ? e.failure.code + (e.message && e.message !== e.failure.code ? ": " + e.message : "") : String((e && e.message) || e))`;
+function store(name, method) {
+  const n = JSON.stringify(name);
+  return `(${contextValue(`v[${n}] && typeof v[${n}][${JSON.stringify(method)}] === "function"`)} || {})[${n}] || null`;
+}
+var ACCOUNT_SLOT = `(${contextValue(`typeof v.accountSlot === "string"`)} || {}).accountSlot || null`;
+var PAGE_ERROR = `(e) => {
+  const f = e && e.failure;
+  if (f && f.code === "sand-box-blocked" && /PARK/.test(f.sandBoxBlockReason || ""))
+    return "Grok Bot paused the Bot's computer because nobody is using this Mac (" + f.sandBoxBlockReason + "). Use the Mac (move the mouse or type), then try again.";
+  if (f && f.code) return f.code + (e.message && e.message !== f.code ? ": " + e.message : "");
+  return String((e && e.message) || e);
+}`;
+var PAGE_AWAKE = `async (id, fn) => {
+  for (let i = 0; ; i++) {
+    await Promise.resolve(window.desktop?.main?.signalBoxIntent?.({ agentId: id, intent: "composer_focus" })).catch(() => {});
+    try { return await fn(); } catch (e) {
+      const f = e && e.failure;
+      // Away-park lasts until someone uses the Mac, so retrying won't help.
+      if (i >= 8 || !(f && f.code === "sand-box-blocked") || f.sandBoxBlockReason === "SAND_AWAY_PARK") throw e;
+      await new Promise((s) => setTimeout(s, 1500));
+    }
+  }
+}`;
 
 // src/bot.ts
 var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -221,17 +243,22 @@ var LIB = `
   const label = (o) => { for (const k of ["title", "summary", "text", "content", "prompt", "label", "name"]) if (typeof o[k] === "string" && o[k]) return " " + o[k].slice(0, 500); return ""; };
   const toMessage = (e) => {
     const m = e.message;
-    let role = "card", text;
+    let role = "card", text, file = null;
     if (e.kind === "message") { role = e.role === "user" ? "user" : "assistant"; text = e.content || ""; }
-    else if (e.kind === "user-attachment") { role = "user"; text = "[file] " + (e.file_name || e.file_path || ""); }
+    else if (e.kind === "user-attachment") { role = "user"; text = "[file] " + (e.file_name || e.file_path || ""); file = e.file_path; }
     else if (e.kind === "send-message" && m && m.type === "text") { role = "assistant"; text = m.content || ""; }
-    else if (e.kind === "send-message" && m && m.type === "attachment") { role = "assistant"; text = "[attachment]" + label(m) + (m.url ? " " + m.url : ""); }
+    else if (e.kind === "send-message" && m && m.type === "attachment") {
+      role = "assistant";
+      if (typeof m.url === "string" && m.url.startsWith("file://")) { file = decodeURIComponent(m.url.slice(7)); text = "[file] " + (m.file_name || file.split("/").pop()); }
+      else text = "[attachment] " + (m.file_name || m.alt || "") + (m.url ? " " + m.url : "");
+    }
     else if (e.kind === "send-message" && m && m.type === "widget" && m.widget) {
       const opts = (m.widget.options || []).map((o) => o.label).filter(Boolean);
       text = (m.widget.prompt || "[question]") + (opts.length ? "\\nOptions: " + opts.join(" / ") : "");
     } else text = "[" + (m ? m.type : e.kind) + "]" + label(m || e);
     text = text.trim();
-    const out = { key: e.id, role, kind: m ? e.kind + "/" + m.type : e.kind, text, links: urls(text), at: iso(e.timestampMs) };
+    const out = { key: e.id, role, kind: m ? e.kind + "/" + m.type : e.kind, text, links: urls(text), at: iso(e.timestampMs),
+      ...(file ? { file: { name: (m && m.file_name) || e.file_name || file.split("/").pop(), path: file } } : {}) };
     return e.isStreaming ? { ...out, streaming: true } : out;
   };
   // Load a Bot's transcript into the store (the app loads only the ones you open) and keep it live until release().
@@ -389,6 +416,17 @@ var PAGE_STOP = page("id", `const row = rowOf(id);
     else await Promise.allSettled(sessions.map((s) => roster.interruptAgentRun({ agentId: id, sessionId: s })));
   } catch (e) { throw new Error("Grok Bot couldn't stop the Bot: " + errorText(e)); }
   return true;`);
+var PAGE_DOWNLOAD = page("id, path, maxBytes", `const files = ${store("desktop", "readAttachmentBytes")};
+  const slot = ${ACCOUNT_SLOT};
+  if (!files || !slot) throw new Error("Couldn't reach Grok Bot's file reader. This app version may not support it.");
+  let r;
+  try { r = await files.readAttachmentBytes({ path, agentId: id, maxBytes, viewSlot: slot }); }
+  catch (e) { throw new Error("Couldn't read " + path + " from the Bot's computer: " + errorText(e)); }
+  if (!r || r.kind !== "bytes") throw new Error("Couldn't read " + path + (r && r.kind ? " (" + r.kind + ")" : ""));
+  const bytes = r.bytes instanceof Uint8Array ? r.bytes : new Uint8Array(r.bytes);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);`);
 async function listBots(cdp) {
   const bots = await cdp.call(PAGE_BOTS);
   if (!bots.length)
@@ -486,6 +524,51 @@ async function stop(cdp, botQuery) {
   const bot = await findBot(cdp, botQuery);
   return { bot: bot.name, stopped: await cdp.call(PAGE_STOP, bot.id) };
 }
+var MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+async function writeNew(dir, name, data) {
+  await mkdir(dir, { recursive: true });
+  const ext = extname(name);
+  const stem = name.slice(0, name.length - ext.length) || "file";
+  for (let n = 0;; n++) {
+    const target = join2(dir, n ? `${stem} (${n})${ext}` : name);
+    const fh = await openFile(target, "wx").catch((e) => {
+      if (e.code === "EEXIST")
+        return null;
+      throw e;
+    });
+    if (!fh)
+      continue;
+    try {
+      await fh.writeFile(data);
+    } finally {
+      await fh.close();
+    }
+    return target;
+  }
+}
+async function download(cdp, botQuery, keys, outDir = ".") {
+  const { bot, messages } = await read(cdp, botQuery, { limit: 1000 });
+  const id = (await findBot(cdp, bot)).id;
+  const withFiles = messages.filter((m) => m.file);
+  const picked = keys.length ? keys.map((k) => {
+    const m = messages.find((x) => x.key === k);
+    if (!m)
+      throw new Error(`No message with key ${k} in ${bot}'s conversation.`);
+    if (!m.file)
+      throw new Error(`Message ${k} has no file.`);
+    return m;
+  }) : withFiles.filter((m) => m.role === "assistant").slice(-1);
+  if (!picked.length)
+    throw new Error(`${bot} hasn't sent any files.`);
+  const files = [];
+  for (const m of picked) {
+    const file = m.file;
+    const data = Buffer.from(await cdp.call(PAGE_DOWNLOAD, id, file.path, MAX_DOWNLOAD_BYTES), "base64");
+    const savedTo = await writeNew(resolve(outDir), basename(file.name), data);
+    files.push({ name: file.name, from: file.path, savedTo, bytes: data.length });
+  }
+  return { bot, files };
+}
 async function usage(cdp) {
   const get = () => cdp.call(`async () => { const m = window.desktop?.main; return m?.getCursorUsageSummary ? await m.getCursorUsageSummary() : null; }`);
   const s = await get().catch(async (e) => {
@@ -520,15 +603,7 @@ var PAGE_OP = `async (op, arg) => {
   if (!roster) return { error: ${JSON.stringify(NO_ROSTER)} };
   const profile = (r) => ({ id: r.id, name: r.name, description: r.description || "", hidden: !!r.isHiddenFromSidebar, running: !!r.isRunning });
   const message = ${PAGE_ERROR};
-  const awake = async (id, fn) => {
-    for (let i = 0; ; i++) {
-      await Promise.resolve(window.desktop?.main?.signalBoxIntent?.({ agentId: id, intent: "composer_focus" })).catch(() => {});
-      try { return await fn(); } catch (e) {
-        if (i >= 8 || !(e && e.failure && e.failure.code === "sand-box-blocked")) throw e;
-        await new Promise((s) => setTimeout(s, 1500));
-      }
-    }
-  };
+  const awake = ${PAGE_AWAKE};
   try {
     if (op === "create") {
       const res = await roster.createAgent({ name: arg.name, description: arg.description, origin: "user", isKickstartRequested: false });
@@ -592,6 +667,107 @@ async function deleteBot(cdp, query) {
   return { id: bot.id, name: bot.name };
 }
 
+// src/routines.ts
+var PAGE_ROUTINES = `async (op, id, arg) => {
+  const routines = ${store("automations", "snapshotsFor")};
+  if (!routines) return { error: "Couldn't reach Grok Bot's routines. This app version may not support them." };
+  const errorText = ${PAGE_ERROR};
+  const awake = ${PAGE_AWAKE};
+  const iso = (ms) => (typeof ms === "number" && ms > 0 ? new Date(ms).toISOString() : typeof ms === "string" ? ms : null);
+  const trigger = (t) => !t ? "" : t.type === "cron" ? "cron " + t.schedule : t.type === "group" ? (t.listeners || []).map(trigger).join(" + ") : t.type;
+  const toRoutine = (a) => {
+    const runs = Array.isArray(a.runs) ? a.runs : [];
+    const last = runs.slice().sort((x, y) => (Date.parse(iso(y.startedAt ?? y.createdAt ?? y.at) || "") || 0) - (Date.parse(iso(x.startedAt ?? x.createdAt ?? x.at) || "") || 0))[0];
+    const spec = a.spec || a;
+    return { id: a.id, name: spec.name ?? a.name ?? "", prompt: spec.prompt ?? a.prompt ?? "", trigger: trigger(spec.trigger ?? a.trigger),
+      enabled: (a.isEnabled ?? spec.isEnabled ?? a.enabled) !== false,
+      lastRun: last ? { at: iso(last.startedAt ?? last.createdAt ?? last.at), status: last.status ?? last.state ?? last.outcome ?? null, trigger: last.trigger ?? null } : null };
+  };
+  routines.connect();
+  const snaps = routines.snapshotsFor(id);
+  const unsubscribe = snaps.subscribe(() => {});
+  const installed = () => { const s = snaps.get() || {}; return s.installed ?? (s.value && s.value.installed) ?? (Array.isArray(s.value) ? s.value : []); };
+  const load = async () => {
+    routines.refresh(id);
+    for (const t0 = Date.now(); ; await new Promise((r) => setTimeout(r, 200))) {
+      const s = snaps.get() || {};
+      if (s.status !== "loading" && s.status !== "idle") {
+        if (s.status === "failed") throw new Error("Couldn't load routines: " + errorText(s.failure || s.error || "failed"));
+        return;
+      }
+      if (Date.now() - t0 > 20000) throw new Error("Timed out loading routines.");
+    }
+  };
+  try {
+    await load();
+    if (op === "list") return { value: installed().map(toRoutine) };
+    if (op === "add") {
+      const before = new Set(installed().map((a) => a.id));
+      const res = await awake(id, () => routines.create(id, arg));
+      await load();
+      const added = installed().find((a) => !before.has(a.id)) || (res && res.id ? res : null);
+      return { value: added ? toRoutine(added) : null };
+    }
+    const target = installed().find((a) => a.id === arg.routine);
+    if (!target) return { error: "That routine is gone." };
+    if (op === "run") await awake(id, () => routines.runNow(id, target.id));
+    else if (op === "enable" || op === "disable") await awake(id, () => routines.setEnabled(id, target.id, op === "enable"));
+    else if (op === "remove") await awake(id, () => routines.remove(id, target.id));
+    else return { error: "Unknown routines operation " + op };
+    await load();
+    const now = installed().find((a) => a.id === target.id);
+    return { value: now ? toRoutine(now) : { ...toRoutine(target), removed: true } };
+  } catch (e) {
+    return { error: errorText(e) };
+  } finally {
+    unsubscribe();
+  }
+}`;
+async function op2(cdp, name, botId, arg) {
+  const r = await cdp.call(PAGE_ROUTINES, name, botId, arg ?? null);
+  if (r.error !== undefined)
+    throw new Error(r.error);
+  return r.value;
+}
+async function listRoutines(cdp, botQuery) {
+  const bot = await findBot(cdp, botQuery);
+  return { bot: bot.name, routines: await op2(cdp, "list", bot.id) };
+}
+function matchRoutine(routines, query, exact) {
+  const q = query.trim().toLowerCase();
+  const hits = routines.filter((r) => r.id === query.trim() || r.name.toLowerCase() === q);
+  if (hits.length === 1)
+    return hits[0];
+  const partial = exact || hits.length ? [] : routines.filter((r) => r.name.toLowerCase().startsWith(q));
+  if (partial.length === 1)
+    return partial[0];
+  const names = routines.map((r) => `${r.name} (${r.id})`).join(", ") || "none";
+  throw new Error(hits.length + partial.length > 1 ? `"${query}" matches several routines. Use the id: ${names}` : `No routine "${query}". Routines: ${names}`);
+}
+async function addRoutine(cdp, botQuery, spec) {
+  const name = spec.name.trim();
+  const prompt = spec.prompt.trim();
+  const schedule = spec.schedule.trim();
+  if (!name || !prompt || !schedule)
+    throw new Error("A routine needs a name, a prompt and a schedule.");
+  if (schedule.split(/\s+/).length !== 5)
+    throw new Error(`"${schedule}" isn't a 5-field cron schedule, e.g. "0 9 * * 1-5".`);
+  const bot = await findBot(cdp, botQuery);
+  const routine = await op2(cdp, "add", bot.id, {
+    name,
+    prompt,
+    trigger: { type: "cron", schedule },
+    isEnabled: spec.enabled !== false
+  });
+  return { bot: bot.name, routine };
+}
+async function changeRoutine(cdp, botQuery, routineQuery, action) {
+  const { bot, routines } = await listRoutines(cdp, botQuery);
+  const target = matchRoutine(routines, routineQuery, action === "remove");
+  const botId = (await findBot(cdp, bot)).id;
+  return { bot, routine: await op2(cdp, action, botId, { routine: target.id }) };
+}
+
 // src/version.ts
 var VERSION = "0.1.0";
 
@@ -651,6 +827,39 @@ var TOOLS = [
     name: "grokbot_stop",
     description: "Interrupt what a Grok Bot is doing, like the app's Stop button. Use when the user asks, or a task is clearly running away.",
     inputSchema: { type: "object", properties: { bot: { type: "string" } }, required: ["bot"], additionalProperties: false }
+  },
+  {
+    name: "grokbot_download",
+    description: "Save files from a Grok Bot conversation to a local folder: the messages with these keys (from grokbot_read; file messages have a 'file' field), or by default the newest file the Bot sent. Never overwrites existing files. Returns the saved paths.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot: { type: "string" },
+        keys: { type: "array", items: { type: "string" }, description: "Message keys of file messages" },
+        out_dir: { type: "string", description: "Absolute folder to save into (default: the server's working folder)" }
+      },
+      required: ["bot"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "grokbot_routines",
+    description: "Manage a Grok Bot's routines (prompts it runs on a schedule). action 'list' shows them; 'add' needs name, schedule (5-field cron) and prompt; 'run', 'enable', 'disable' and 'remove' need routine (name or id; remove needs the exact name or id and confirm repeating it). Running or enabling a routine uses the user's Grok Bot usage, so only change routines when the user asked.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["list", "add", "run", "enable", "disable", "remove"] },
+        bot: { type: "string" },
+        routine: { type: "string", description: "Routine name or id (run/enable/disable/remove)" },
+        confirm: { type: "string", description: "remove: repeat the routine value" },
+        name: { type: "string", description: "add: routine name" },
+        schedule: { type: "string", description: "add: cron schedule, e.g. '0 9 * * 1-5'" },
+        prompt: { type: "string", description: "add: what the Bot does each run" },
+        enabled: { type: "boolean", description: "add: start turned on (default true)" }
+      },
+      required: ["action", "bot"],
+      additionalProperties: false
+    }
   },
   {
     name: "grokbot_create_bot",
@@ -752,6 +961,28 @@ async function callTool(name, args) {
         timeoutMs: seconds("timeout_seconds", 600, 10, 3600),
         settleMs: seconds("settle_seconds", 8, 2, 120)
       }));
+    case "grokbot_download": {
+      const keys = Array.isArray(args.keys) ? args.keys.map(String) : [];
+      return withApp((c) => download(c, str("bot"), keys, opt("out_dir")));
+    }
+    case "grokbot_routines": {
+      const action = str("action");
+      if (action === "list")
+        return withApp((c) => listRoutines(c, str("bot")));
+      if (action === "add") {
+        return withApp((c) => addRoutine(c, str("bot"), {
+          name: str("name"),
+          schedule: str("schedule"),
+          prompt: str("prompt"),
+          enabled: args.enabled !== false
+        }));
+      }
+      if (!["run", "enable", "disable", "remove"].includes(action))
+        throw new Error(`Unknown action "${action}".`);
+      if (action === "remove" && str("confirm") !== str("routine"))
+        throw new Error('"confirm" must repeat the "routine" value exactly.');
+      return withApp((c) => changeRoutine(c, str("bot"), str("routine"), action));
+    }
     case "grokbot_stop":
       return withApp((c) => stop(c, str("bot")));
     case "grokbot_create_bot":
@@ -832,6 +1063,11 @@ Usage:
   grokbot read <bot>                Show recent messages in a conversation
   grokbot watch [bot]               Stream new replies and working/idle changes as JSON lines
   grokbot stop <bot>                Interrupt what the Bot is doing (like the Stop button)
+  grokbot download <bot> [key...]   Save files from the conversation (default: the newest one the Bot sent)
+  grokbot routines <bot>            List the Bot's routines (scheduled and triggered prompts)
+  grokbot routines add <bot> --name <n> --schedule "<cron>" --prompt <text>   Add a scheduled routine
+  grokbot routines run|enable|disable <bot> <routine>   Run a routine now, or turn it on or off
+  grokbot routines remove <bot> <routine> --yes   Delete a routine (exact name or id)
   grokbot bots                      List your Bots and what each is doing
   grokbot create <name>             Create a Bot (--description <text>)
   grokbot update <bot>              Rename a Bot or change its description (--name, --description)
@@ -848,9 +1084,13 @@ Options:
   --settle <sec>    ask/wait/watch: idle seconds before a reply counts as finished (default 8)
   --since <key>     wait/read: messages after this message key (from send/ask/read --json)
   --limit <n>       read: number of messages (default 10)
+  --out <dir>       download: where to save (default: current folder; never overwrites)
+  --schedule <cron> routines add: 5-field cron schedule, e.g. "0 9 * * 1-5"
+  --prompt <text>   routines add: what the Bot does each run ("-" reads stdin)
+  --disabled        routines add: create it turned off
   --name <text>     update: new name
   --description <t> create/update: what the Bot is for
-  --yes             delete: confirm deleting the Bot
+  --yes             delete, routines remove: confirm
   --json            Machine-readable output
   --quiet           ask/wait: don't stream progress to stderr
   -v, --version     Print version
@@ -865,11 +1105,11 @@ function parse(argv) {
   const rest = [];
   for (let i = 0;i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--json" || a === "--quiet" || a === "--yes")
+    if (a === "--json" || a === "--quiet" || a === "--yes" || a === "--disabled")
       flags[a.slice(2)] = true;
     else if (a === "--file")
       files.push(argv[++i] ?? "");
-    else if (["--timeout", "--limit", "--settle", "--since", "--name", "--description"].includes(a))
+    else if (["--timeout", "--limit", "--settle", "--since", "--name", "--description", "--out", "--schedule", "--prompt"].includes(a))
       flags[a.slice(2)] = argv[++i] ?? "";
     else if (a === "-h" || a === "--help")
       flags.help = true;
@@ -931,6 +1171,11 @@ function printReplies(r, json, extra = {}) {
   }
   if (r.status !== "done")
     process.exitCode = r.status === "needs_input" ? 3 : 2;
+}
+function formatRoutine(r) {
+  const last = r.lastRun?.at ? ` · last run ${new Date(r.lastRun.at).toLocaleString()}${r.lastRun.status ? ` (${r.lastRun.status})` : ""}` : "";
+  return `${r.name}  (${r.id})  [${r.enabled ? "on" : "off"}] ${r.trigger}${last}
+    ${r.prompt.replace(/\s+/g, " ").slice(0, 200)}`;
 }
 async function withApp2(fn) {
   const { restarted } = await launch();
@@ -1054,6 +1299,44 @@ ${formatUsage(s.usage)}` : ""}`);
         return watch(c, bot, line, positiveNumber(flags.settle, "settle", 8) * 1000);
       });
       return;
+    }
+    case "download": {
+      const [bot, ...keys] = args;
+      if (!bot)
+        throw new Error("Usage: grokbot download <bot> [message key...] [--out <dir>]");
+      const r = await withApp2((c) => download(c, bot, keys, str(flags.out)));
+      return out(r, () => r.files.map((f) => `Saved ${f.name} (${f.bytes} bytes) to ${f.savedTo}`).join(`
+`));
+    }
+    case "routines": {
+      const actions = ["add", "run", "enable", "disable", "remove"];
+      const action = actions.includes(args[0]) ? args[0] : "list";
+      const [bot, ...rest] = action === "list" ? args : args.slice(1);
+      if (!bot)
+        throw new Error("Usage: grokbot routines <bot> | routines add|run|enable|disable|remove <bot> ...");
+      if (action === "list") {
+        const r2 = await withApp2((c) => listRoutines(c, bot));
+        return out(r2, () => r2.routines.length ? r2.routines.map(formatRoutine).join(`
+`) : `${r2.bot} has no routines.`);
+      }
+      if (action === "add") {
+        const name = str(flags.name);
+        const schedule = str(flags.schedule);
+        const prompt = str(flags.prompt) === "-" ? await readMessage(["-"]) : str(flags.prompt);
+        if (!name || !schedule || !prompt)
+          throw new Error('Usage: grokbot routines add <bot> --name <name> --schedule "<cron>" --prompt <text> [--disabled]');
+        const r2 = await withApp2((c) => addRoutine(c, bot, { name, schedule, prompt, enabled: !flags.disabled }));
+        return out(r2, () => r2.routine ? `Added to ${r2.bot}:
+${formatRoutine(r2.routine)}` : `Added "${name}" to ${r2.bot}.`);
+      }
+      const routine = rest.join(" ").trim();
+      if (!routine)
+        throw new Error(`Usage: grokbot routines ${action} <bot> <routine>${action === "remove" ? " --yes" : ""}`);
+      if (action === "remove" && !flags.yes)
+        throw new Error(`This permanently deletes the routine "${routine}". Run again with --yes to confirm.`);
+      const r = await withApp2((c) => changeRoutine(c, bot, routine, action));
+      const done = { run: "Started", enable: "Turned on", disable: "Turned off", remove: "Deleted" }[action];
+      return out(r, () => `${done} ${r.routine.name} for ${r.bot}.${action === "run" ? ` Run \`grokbot wait ${r.bot}\` for the result.` : ""}`);
     }
     case "stop": {
       const bot = args.join(" ").trim();

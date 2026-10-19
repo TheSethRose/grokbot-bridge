@@ -3,6 +3,7 @@ import { launch, restore } from "./app.ts";
 import {
   ask,
   type BotEvent,
+  download,
   listBots,
   type Message,
   read,
@@ -18,6 +19,7 @@ import {
 import { CDP, cdpPort, listTargets } from "./cdp.ts";
 import { serveMcp } from "./mcp.ts";
 import { createBot, deleteBot, updateBot } from "./roster.ts";
+import { addRoutine, changeRoutine, listRoutines, type Routine, type RoutineAction } from "./routines.ts";
 import { VERSION } from "./version.ts";
 
 const USAGE = `grokbot ${VERSION} — talk to your Grok Bots from the terminal or any agent
@@ -29,6 +31,11 @@ Usage:
   grokbot read <bot>                Show recent messages in a conversation
   grokbot watch [bot]               Stream new replies and working/idle changes as JSON lines
   grokbot stop <bot>                Interrupt what the Bot is doing (like the Stop button)
+  grokbot download <bot> [key...]   Save files from the conversation (default: the newest one the Bot sent)
+  grokbot routines <bot>            List the Bot's routines (scheduled and triggered prompts)
+  grokbot routines add <bot> --name <n> --schedule "<cron>" --prompt <text>   Add a scheduled routine
+  grokbot routines run|enable|disable <bot> <routine>   Run a routine now, or turn it on or off
+  grokbot routines remove <bot> <routine> --yes   Delete a routine (exact name or id)
   grokbot bots                      List your Bots and what each is doing
   grokbot create <name>             Create a Bot (--description <text>)
   grokbot update <bot>              Rename a Bot or change its description (--name, --description)
@@ -45,9 +52,13 @@ Options:
   --settle <sec>    ask/wait/watch: idle seconds before a reply counts as finished (default 8)
   --since <key>     wait/read: messages after this message key (from send/ask/read --json)
   --limit <n>       read: number of messages (default 10)
+  --out <dir>       download: where to save (default: current folder; never overwrites)
+  --schedule <cron> routines add: 5-field cron schedule, e.g. "0 9 * * 1-5"
+  --prompt <text>   routines add: what the Bot does each run ("-" reads stdin)
+  --disabled        routines add: create it turned off
   --name <text>     update: new name
   --description <t> create/update: what the Bot is for
-  --yes             delete: confirm deleting the Bot
+  --yes             delete, routines remove: confirm
   --json            Machine-readable output
   --quiet           ask/wait: don't stream progress to stderr
   -v, --version     Print version
@@ -63,9 +74,10 @@ function parse(argv: string[]) {
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--json" || a === "--quiet" || a === "--yes") flags[a.slice(2)] = true;
+    if (a === "--json" || a === "--quiet" || a === "--yes" || a === "--disabled") flags[a.slice(2)] = true;
     else if (a === "--file") files.push(argv[++i] ?? "");
-    else if (["--timeout", "--limit", "--settle", "--since", "--name", "--description"].includes(a)) flags[a.slice(2)] = argv[++i] ?? "";
+    else if (["--timeout", "--limit", "--settle", "--since", "--name", "--description", "--out", "--schedule", "--prompt"].includes(a))
+      flags[a.slice(2)] = argv[++i] ?? "";
     else if (a === "-h" || a === "--help") flags.help = true;
     else if (a === "-v" || a === "--version") flags.version = true;
     else rest.push(a);
@@ -124,6 +136,13 @@ function printReplies(r: WaitResult, json: boolean, extra: Record<string, unknow
     console.log((body || (r.status === "done" ? "(The Bot finished without replying.)" : "(no reply yet)")) + tail);
   }
   if (r.status !== "done") process.exitCode = r.status === "needs_input" ? 3 : 2;
+}
+
+function formatRoutine(r: Routine): string {
+  const last = r.lastRun?.at
+    ? ` · last run ${new Date(r.lastRun.at).toLocaleString()}${r.lastRun.status ? ` (${r.lastRun.status})` : ""}`
+    : "";
+  return `${r.name}  (${r.id})  [${r.enabled ? "on" : "off"}] ${r.trigger}${last}\n    ${r.prompt.replace(/\s+/g, " ").slice(0, 200)}`;
 }
 
 async function withApp<T>(fn: (cdp: CDP) => Promise<T>): Promise<T> {
@@ -251,6 +270,41 @@ async function main() {
         return watch(c, bot, line, positiveNumber(flags.settle, "settle", 8) * 1000);
       });
       return;
+    }
+    case "download": {
+      const [bot, ...keys] = args;
+      if (!bot) throw new Error("Usage: grokbot download <bot> [message key...] [--out <dir>]");
+      const r = await withApp((c) => download(c, bot, keys, str(flags.out)));
+      return out(r, () => r.files.map((f) => `Saved ${f.name} (${f.bytes} bytes) to ${f.savedTo}`).join("\n"));
+    }
+    case "routines": {
+      const actions = ["add", "run", "enable", "disable", "remove"];
+      const action = actions.includes(args[0]) ? args[0] : "list";
+      const [bot, ...rest] = action === "list" ? args : args.slice(1);
+      if (!bot) throw new Error("Usage: grokbot routines <bot> | routines add|run|enable|disable|remove <bot> ...");
+      if (action === "list") {
+        const r = await withApp((c) => listRoutines(c, bot));
+        return out(r, () => (r.routines.length ? r.routines.map(formatRoutine).join("\n") : `${r.bot} has no routines.`));
+      }
+      if (action === "add") {
+        const name = str(flags.name);
+        const schedule = str(flags.schedule);
+        const prompt = str(flags.prompt) === "-" ? await readMessage(["-"]) : str(flags.prompt);
+        if (!name || !schedule || !prompt)
+          throw new Error('Usage: grokbot routines add <bot> --name <name> --schedule "<cron>" --prompt <text> [--disabled]');
+        const r = await withApp((c) => addRoutine(c, bot, { name, schedule, prompt, enabled: !flags.disabled }));
+        return out(r, () => (r.routine ? `Added to ${r.bot}:\n${formatRoutine(r.routine)}` : `Added "${name}" to ${r.bot}.`));
+      }
+      const routine = rest.join(" ").trim();
+      if (!routine) throw new Error(`Usage: grokbot routines ${action} <bot> <routine>${action === "remove" ? " --yes" : ""}`);
+      if (action === "remove" && !flags.yes)
+        throw new Error(`This permanently deletes the routine "${routine}". Run again with --yes to confirm.`);
+      const r = await withApp((c) => changeRoutine(c, bot, routine, action as RoutineAction));
+      const done = { run: "Started", enable: "Turned on", disable: "Turned off", remove: "Deleted" }[action as RoutineAction];
+      return out(
+        r,
+        () => `${done} ${r.routine.name} for ${r.bot}.${action === "run" ? ` Run \`grokbot wait ${r.bot}\` for the result.` : ""}`,
+      );
     }
     case "stop": {
       const bot = args.join(" ").trim();

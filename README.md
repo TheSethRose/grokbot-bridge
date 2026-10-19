@@ -27,7 +27,7 @@ Your coding agent is good at code. Your Grok Bot is good at things that need a b
 
 - **Claude Code → Grok Bot:** "Ask Chief to collect B-roll posts for this transcript and send me the links."
 - **Scripts → Grok Bot:** `grokbot ask Chief "$(cat brief.md)" --json | jq …`
-- **Any MCP client:** tools to message Bots (with files), wait for and read replies, stop a Bot, check usage, and create, rename or delete Bots.
+- **Any MCP client:** tools to message Bots (with files), wait for and read replies, download files Bots send, manage routines, stop a Bot, check usage, and create, rename or delete Bots.
 
 ## Requirements
 
@@ -67,6 +67,11 @@ Every command except `status` and `restore` calls `launch` for you if the app is
 | `grokbot read <bot> [--limit N] [--since <key>]` | Print messages in the conversation: the last N, or everything after a key |
 | `grokbot watch [bot]` | Stream new replies and `working` / `idle` / `needs_input` changes, one line each |
 | `grokbot stop <bot>` | Interrupt what the Bot is doing, like the app's Stop button |
+| `grokbot download <bot> [key…] [--out <dir>]` | Save files from the conversation: the messages with those keys, or the newest file the Bot sent. Never overwrites |
+| `grokbot routines <bot>` | List the Bot's routines: prompts it runs on a schedule or trigger |
+| `grokbot routines add <bot> --name <n> --schedule "<cron>" --prompt <text> [--disabled]` | Add a scheduled routine. `--prompt -` reads stdin |
+| `grokbot routines run\|enable\|disable <bot> <routine>` | Run a routine now, or turn it on or off |
+| `grokbot routines remove <bot> <routine> --yes` | Delete a routine. Needs the exact name or id |
 | `grokbot bots` | List Bots with their id and whether each is working, needs your input or has unread messages |
 | `grokbot create <name> [--description <text>]` | Create a Bot. It starts working when you send it a message |
 | `grokbot update <bot> [--name <new>] [--description <text>]` | Rename a Bot or change its description |
@@ -80,6 +85,8 @@ Every command except `status` and `restore` calls `launch` for you if the app is
 Options: `--json` for machine-readable output, `--file <path>` to attach a file to `ask` or `send` (repeat it for several, 25 MB each), `--timeout <sec>` for `ask` (default 300) and `wait` (default 1800), `--settle <sec>` for how long a Bot must stay idle before its reply counts as finished (default 8), `--quiet` to stop progress lines on stderr. Pass `-` as the message to read it from stdin.
 
 `ask` and `wait` exit with `0` when the Bot has finished, `2` if it's still working at the timeout, and `3` if it's waiting for you in the app (an approval card or a question). Bots often acknowledge first and report back minutes later; run `grokbot wait <bot>` again to keep waiting.
+
+In `--json` output, file messages carry a `file` field (`name`, and `path` on the Bot's computer); pass their `key` to `download`. Schedules are standard 5-field cron, for example `"0 9 * * 1-5"` for 9:00 on weekdays.
 
 ### Getting told when a Bot replies
 
@@ -103,7 +110,7 @@ $ grokbot watch --json
 
 ### MCP (Claude Code, Cursor, Codex and others)
 
-The server exposes ten tools: `grokbot_list_bots`, `grokbot_ask`, `grokbot_send`, `grokbot_wait`, `grokbot_read`, `grokbot_stop`, `grokbot_usage`, `grokbot_create_bot`, `grokbot_update_bot` and `grokbot_delete_bot`. `grokbot_ask` and `grokbot_send` take an optional `files` list. `grokbot_delete_bot` requires a `confirm` argument that repeats the Bot's exact name.
+The server exposes twelve tools: `grokbot_list_bots`, `grokbot_ask`, `grokbot_send`, `grokbot_wait`, `grokbot_read`, `grokbot_stop`, `grokbot_download`, `grokbot_routines`, `grokbot_usage`, `grokbot_create_bot`, `grokbot_update_bot` and `grokbot_delete_bot`. `grokbot_ask` and `grokbot_send` take an optional `files` list. `grokbot_routines` takes an `action` (`list`, `add`, `run`, `enable`, `disable`, `remove`). `grokbot_delete_bot` and removing a routine require a `confirm` argument that repeats the exact name.
 
 **Claude Code**
 
@@ -148,6 +155,8 @@ Grok Bot is an Electron app. `grokbot launch` restarts it with Chromium's `--rem
 - **Sending:** messages and files go through the send queue the message box uses (files are staged first, the same way dragging a file onto the box does), so they show up in your history like anything you typed. The bridge never types into the message box, so your drafts are safe.
 - **Waiting:** `wait`, `ask` and `watch` subscribe to the Bot list and transcript change events. A Bot counts as finished when it hasn't been working, using tools or typing for the settle time. If it's blocked on an approval card, they return `needs_input` right away.
 - **Stopping:** `stop` calls the same interrupt as the Stop button, for every session the Bot is running.
+- **Files:** `download` reads a file from the Bot's computer the way the app's file previews do, then saves it locally.
+- **Routines:** `routines` uses the store behind the app's routines screen.
 
 `grokbot usage` calls the read-only getter that the app's own settings card uses, so it returns the same "Weekly usage limit" numbers.
 
@@ -156,7 +165,9 @@ $ grokbot usage
 Weekly usage: 1.37% used · resets 10/22/2026, 11:44:33 AM (in 4 days) · plan: X Premium+
 ```
 
-`create`, `update` and `delete` call the same Bot-list client the app's own New Bot, rename and delete actions use. Edits are saved on the Bot's cloud computer, which the app pauses while nobody is at the Mac. The bridge first sends the app's own "user is here" signal, the same one clicking into a message box sends. The main Bot can't be deleted.
+`create`, `update` and `delete` call the same Bot-list client the app's own New Bot, rename and delete actions use. The main Bot can't be deleted.
+
+Bot edits and routine changes are saved on the Bot's cloud computer. The bridge first sends the app's own "user is here" signal, the same one clicking into a message box sends. If nobody has used the Mac for a while, Grok Bot parks the computer (`SAND_AWAY_PARK`) and these changes fail with a message saying so until someone uses the Mac again. Messages still go through while it's parked.
 
 Messages go through the app's normal send path, so they show up in your conversation history like any message you typed. The bridge makes no network calls of its own and has no runtime dependencies.
 
@@ -181,6 +192,7 @@ Environment variables: `GROKBOT_CDP_PORT` (default `9333`) and `GROKBOT_APP` (pa
 - **App updates can break it.** The bridge relies on internal stores of the app's renderer. The lookups live in [`src/page.ts`](src/page.ts) and the field names in [`src/bot.ts`](src/bot.ts), so fixes are usually small. Please open an issue with your Grok Bot version.
 - **A Stop leaves no trace in the transcript.** A `wait` that is running when you stop a Bot returns with no messages, but one started afterwards can't tell a stopped message from one the Bot hasn't picked up yet, so it waits until its timeout.
 - The Bot's internal tool steps are left out of `read` and `wait`, as the app folds them away too.
+- **Routines and Bot edits need someone at the Mac.** See [How it works](#how-it-works).
 
 ## Development
 
@@ -191,7 +203,7 @@ bun run check               # tsc + Biome
 bun run build               # bundle to dist/cli.js (Node 22+)
 ```
 
-`dist/cli.js` is committed so installing from GitHub works without a build step. Rebuild it before you commit.
+`dist/cli.js` is committed so installing from GitHub works without a build step. Rebuild it before you commit. Notes for coding agents are in [`AGENTS.md`](AGENTS.md).
 
 ## License
 

@@ -1,7 +1,7 @@
 // Create, update and delete Bots through the app's own roster client (see page.ts).
 import { listBots, matchBot } from "./bot.ts";
 import type { CDP } from "./cdp.ts";
-import { PAGE_ERROR, store } from "./page.ts";
+import { PAGE_AWAKE, PAGE_ERROR, store } from "./page.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -10,22 +10,13 @@ export type BotProfile = { id: string; name: string; description: string; hidden
 const NO_ROSTER = "Couldn't reach Grok Bot's Bot list. This app version may not support managing Bots.";
 
 // Runs a roster operation in the page. Errors come back as values so messages stay clean.
-// Profile writes go to the Bot's cloud computer, which the app parks while nobody is at the
-// Mac; signalBoxIntent is the same wake-up the app sends when you click into a message box.
+// Profile writes go to the Bot's cloud computer, so they go through PAGE_AWAKE.
 const PAGE_OP = `async (op, arg) => {
   const roster = ${store("roster", "createAgent")};
   if (!roster) return { error: ${JSON.stringify(NO_ROSTER)} };
   const profile = (r) => ({ id: r.id, name: r.name, description: r.description || "", hidden: !!r.isHiddenFromSidebar, running: !!r.isRunning });
   const message = ${PAGE_ERROR};
-  const awake = async (id, fn) => {
-    for (let i = 0; ; i++) {
-      await Promise.resolve(window.desktop?.main?.signalBoxIntent?.({ agentId: id, intent: "composer_focus" })).catch(() => {});
-      try { return await fn(); } catch (e) {
-        if (i >= 8 || !(e && e.failure && e.failure.code === "sand-box-blocked")) throw e;
-        await new Promise((s) => setTimeout(s, 1500));
-      }
-    }
-  };
+  const awake = ${PAGE_AWAKE};
   try {
     if (op === "create") {
       const res = await roster.createAgent({ name: arg.name, description: arg.description, origin: "user", isKickstartRequested: false });

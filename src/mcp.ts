@@ -2,9 +2,10 @@
 // Newline-delimited JSON-RPC 2.0, no SDK dependency.
 import { createInterface } from "node:readline";
 import { launch } from "./app.ts";
-import { ask, listBots, read, send, stop, usage, wait } from "./bot.ts";
+import { ask, download, listBots, read, send, stop, usage, wait } from "./bot.ts";
 import { CDP } from "./cdp.ts";
 import { createBot, deleteBot, updateBot } from "./roster.ts";
+import { addRoutine, changeRoutine, listRoutines, type RoutineAction } from "./routines.ts";
 import { VERSION } from "./version.ts";
 
 const TOOLS = [
@@ -67,6 +68,41 @@ const TOOLS = [
     description:
       "Interrupt what a Grok Bot is doing, like the app's Stop button. Use when the user asks, or a task is clearly running away.",
     inputSchema: { type: "object", properties: { bot: { type: "string" } }, required: ["bot"], additionalProperties: false },
+  },
+  {
+    name: "grokbot_download",
+    description:
+      "Save files from a Grok Bot conversation to a local folder: the messages with these keys (from grokbot_read; file messages have a 'file' field), or by default the newest file the Bot sent. Never overwrites existing files. Returns the saved paths.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot: { type: "string" },
+        keys: { type: "array", items: { type: "string" }, description: "Message keys of file messages" },
+        out_dir: { type: "string", description: "Absolute folder to save into (default: the server's working folder)" },
+      },
+      required: ["bot"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "grokbot_routines",
+    description:
+      "Manage a Grok Bot's routines (prompts it runs on a schedule). action 'list' shows them; 'add' needs name, schedule (5-field cron) and prompt; 'run', 'enable', 'disable' and 'remove' need routine (name or id; remove needs the exact name or id and confirm repeating it). Running or enabling a routine uses the user's Grok Bot usage, so only change routines when the user asked.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["list", "add", "run", "enable", "disable", "remove"] },
+        bot: { type: "string" },
+        routine: { type: "string", description: "Routine name or id (run/enable/disable/remove)" },
+        confirm: { type: "string", description: "remove: repeat the routine value" },
+        name: { type: "string", description: "add: routine name" },
+        schedule: { type: "string", description: "add: cron schedule, e.g. '0 9 * * 1-5'" },
+        prompt: { type: "string", description: "add: what the Bot does each run" },
+        enabled: { type: "boolean", description: "add: start turned on (default true)" },
+      },
+      required: ["action", "bot"],
+      additionalProperties: false,
+    },
   },
   {
     name: "grokbot_create_bot",
@@ -180,6 +216,27 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
           settleMs: seconds("settle_seconds", 8, 2, 120),
         }),
       );
+    case "grokbot_download": {
+      const keys = Array.isArray(args.keys) ? args.keys.map(String) : [];
+      return withApp((c) => download(c, str("bot"), keys, opt("out_dir")));
+    }
+    case "grokbot_routines": {
+      const action = str("action");
+      if (action === "list") return withApp((c) => listRoutines(c, str("bot")));
+      if (action === "add") {
+        return withApp((c) =>
+          addRoutine(c, str("bot"), {
+            name: str("name"),
+            schedule: str("schedule"),
+            prompt: str("prompt"),
+            enabled: args.enabled !== false,
+          }),
+        );
+      }
+      if (!["run", "enable", "disable", "remove"].includes(action)) throw new Error(`Unknown action "${action}".`);
+      if (action === "remove" && str("confirm") !== str("routine")) throw new Error('"confirm" must repeat the "routine" value exactly.');
+      return withApp((c) => changeRoutine(c, str("bot"), str("routine"), action as RoutineAction));
+    }
     case "grokbot_stop":
       return withApp((c) => stop(c, str("bot")));
     case "grokbot_create_bot":

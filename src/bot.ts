@@ -3,10 +3,10 @@
 // works for any Bot without switching the conversation on screen, and waiting is
 // driven by the stores' change events rather than by polling the screen.
 // Store and field names are internal to Grok Bot (0.71.x); see page.ts.
-import { readFile, stat } from "node:fs/promises";
-import { basename } from "node:path";
+import { mkdir, open as openFile, readFile, stat } from "node:fs/promises";
+import { basename, extname, join, resolve } from "node:path";
 import type { CDP } from "./cdp.ts";
-import { PAGE_ERROR, store } from "./page.ts";
+import { ACCOUNT_SLOT, PAGE_ERROR, store } from "./page.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -23,8 +23,19 @@ export type Bot = {
   lastActivity: string | null;
   preview: string | null;
 };
-/** `key` is the transcript entry id (pass it to `since`). `text` keeps links as Markdown; `links` lists every URL. */
-export type Message = { key: string; role: "user" | "assistant" | "card"; kind: string; text: string; links: string[]; at: string | null };
+/**
+ * `key` is the transcript entry id (pass it to `since`). `text` keeps links as Markdown; `links` lists every URL.
+ * `file` is set on file messages; `path` is on the Bot's computer (fetch it with `download`).
+ */
+export type Message = {
+  key: string;
+  role: "user" | "assistant" | "card";
+  kind: string;
+  text: string;
+  links: string[];
+  at: string | null;
+  file?: { name: string; path: string };
+};
 export type WaitStatus = "done" | "timeout" | "needs_input";
 export type WaitResult = { bot: string; status: WaitStatus; messages: Message[]; elapsedMs: number };
 export type AskResult = WaitResult & { key: string };
@@ -53,17 +64,22 @@ const LIB = `
   const label = (o) => { for (const k of ["title", "summary", "text", "content", "prompt", "label", "name"]) if (typeof o[k] === "string" && o[k]) return " " + o[k].slice(0, 500); return ""; };
   const toMessage = (e) => {
     const m = e.message;
-    let role = "card", text;
+    let role = "card", text, file = null;
     if (e.kind === "message") { role = e.role === "user" ? "user" : "assistant"; text = e.content || ""; }
-    else if (e.kind === "user-attachment") { role = "user"; text = "[file] " + (e.file_name || e.file_path || ""); }
+    else if (e.kind === "user-attachment") { role = "user"; text = "[file] " + (e.file_name || e.file_path || ""); file = e.file_path; }
     else if (e.kind === "send-message" && m && m.type === "text") { role = "assistant"; text = m.content || ""; }
-    else if (e.kind === "send-message" && m && m.type === "attachment") { role = "assistant"; text = "[attachment]" + label(m) + (m.url ? " " + m.url : ""); }
+    else if (e.kind === "send-message" && m && m.type === "attachment") {
+      role = "assistant";
+      if (typeof m.url === "string" && m.url.startsWith("file://")) { file = decodeURIComponent(m.url.slice(7)); text = "[file] " + (m.file_name || file.split("/").pop()); }
+      else text = "[attachment] " + (m.file_name || m.alt || "") + (m.url ? " " + m.url : "");
+    }
     else if (e.kind === "send-message" && m && m.type === "widget" && m.widget) {
       const opts = (m.widget.options || []).map((o) => o.label).filter(Boolean);
       text = (m.widget.prompt || "[question]") + (opts.length ? "\\nOptions: " + opts.join(" / ") : "");
     } else text = "[" + (m ? m.type : e.kind) + "]" + label(m || e);
     text = text.trim();
-    const out = { key: e.id, role, kind: m ? e.kind + "/" + m.type : e.kind, text, links: urls(text), at: iso(e.timestampMs) };
+    const out = { key: e.id, role, kind: m ? e.kind + "/" + m.type : e.kind, text, links: urls(text), at: iso(e.timestampMs),
+      ...(file ? { file: { name: (m && m.file_name) || e.file_name || file.split("/").pop(), path: file } } : {}) };
     return e.isStreaming ? { ...out, streaming: true } : out;
   };
   // Load a Bot's transcript into the store (the app loads only the ones you open) and keep it live until release().
@@ -250,6 +266,22 @@ const PAGE_STOP = page(
   return true;`,
 );
 
+// Reads a file from the Bot's computer the way the app's file previews do. Bytes come back as base64.
+const PAGE_DOWNLOAD = page(
+  "id, path, maxBytes",
+  `const files = ${store("desktop", "readAttachmentBytes")};
+  const slot = ${ACCOUNT_SLOT};
+  if (!files || !slot) throw new Error("Couldn't reach Grok Bot's file reader. This app version may not support it.");
+  let r;
+  try { r = await files.readAttachmentBytes({ path, agentId: id, maxBytes, viewSlot: slot }); }
+  catch (e) { throw new Error("Couldn't read " + path + " from the Bot's computer: " + errorText(e)); }
+  if (!r || r.kind !== "bytes") throw new Error("Couldn't read " + path + (r && r.kind ? " (" + r.kind + ")" : ""));
+  const bytes = r.bytes instanceof Uint8Array ? r.bytes : new Uint8Array(r.bytes);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);`,
+);
+
 // ---- public API ----
 
 /** Every Bot on the account, with what it's doing. Hidden Bots are included and marked. */
@@ -387,6 +419,58 @@ export async function watch(cdp: CDP, botQuery: string | null, onEvent: (e: BotE
 export async function stop(cdp: CDP, botQuery: string): Promise<{ bot: string; stopped: boolean }> {
   const bot = await findBot(cdp, botQuery);
   return { bot: bot.name, stopped: await cdp.call<boolean>(PAGE_STOP, bot.id) };
+}
+
+const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+
+/** Writes to `dir/name`, adding " (1)", " (2)"… instead of overwriting an existing file. */
+async function writeNew(dir: string, name: string, data: Buffer): Promise<string> {
+  await mkdir(dir, { recursive: true });
+  const ext = extname(name);
+  const stem = name.slice(0, name.length - ext.length) || "file";
+  for (let n = 0; ; n++) {
+    const target = join(dir, n ? `${stem} (${n})${ext}` : name);
+    const fh = await openFile(target, "wx").catch((e: NodeJS.ErrnoException) => {
+      if (e.code === "EEXIST") return null;
+      throw e;
+    });
+    if (!fh) continue;
+    try {
+      await fh.writeFile(data);
+    } finally {
+      await fh.close();
+    }
+    return target;
+  }
+}
+
+export type Download = { name: string; from: string; savedTo: string; bytes: number };
+
+/**
+ * Save files from a conversation to `outDir`. `keys` picks file messages; with none, saves the
+ * newest file the Bot sent. Existing local files are never overwritten.
+ */
+export async function download(cdp: CDP, botQuery: string, keys: string[], outDir = "."): Promise<{ bot: string; files: Download[] }> {
+  const { bot, messages } = await read(cdp, botQuery, { limit: 1000 });
+  const id = (await findBot(cdp, bot)).id;
+  const withFiles = messages.filter((m) => m.file);
+  const picked = keys.length
+    ? keys.map((k) => {
+        const m = messages.find((x) => x.key === k);
+        if (!m) throw new Error(`No message with key ${k} in ${bot}'s conversation.`);
+        if (!m.file) throw new Error(`Message ${k} has no file.`);
+        return m;
+      })
+    : withFiles.filter((m) => m.role === "assistant").slice(-1);
+  if (!picked.length) throw new Error(`${bot} hasn't sent any files.`);
+  const files: Download[] = [];
+  for (const m of picked) {
+    const file = m.file as { name: string; path: string };
+    const data = Buffer.from(await cdp.call<string>(PAGE_DOWNLOAD, id, file.path, MAX_DOWNLOAD_BYTES), "base64");
+    const savedTo = await writeNew(resolve(outDir), basename(file.name), data);
+    files.push({ name: file.name, from: file.path, savedTo, bytes: data.length });
+  }
+  return { bot, files };
 }
 
 export type Usage = {
