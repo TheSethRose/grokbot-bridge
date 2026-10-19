@@ -27,7 +27,7 @@ Your coding agent is good at code. Your Grok Bot is good at things that need a b
 
 - **Claude Code → Grok Bot:** "Ask Chief to collect B-roll posts for this transcript and send me the links."
 - **Scripts → Grok Bot:** `grokbot ask Chief "$(cat brief.md)" --json | jq …`
-- **Any MCP client:** tools for `ask`, `send`, `read` and `list_bots`.
+- **Any MCP client:** tools for `ask`, `send`, `read`, `list_bots` and `usage`.
 
 ## Requirements
 
@@ -65,7 +65,8 @@ grokbot read Chief             # recent messages in that conversation
 | `grokbot send <bot> <message…>` | Send without waiting |
 | `grokbot read <bot> [--limit N]` | Print recent messages in the conversation |
 | `grokbot bots` | List Bots with their role and id |
-| `grokbot status` | Check the connection |
+| `grokbot usage` | Show your weekly usage limit: percent used, reset time, plan, on-demand spend |
+| `grokbot status` | Check the connection and show usage |
 | `grokbot launch` | Restart Grok Bot with the debug port (127.0.0.1 only) |
 | `grokbot restore` | Restart Grok Bot normally, closing the port |
 | `grokbot mcp` | Run as an MCP server over stdio |
@@ -78,7 +79,7 @@ Options: `--json` for machine-readable output, `--timeout <sec>` for `ask` (defa
 
 ### MCP (Claude Code, Cursor, Codex and others)
 
-The server exposes four tools: `grokbot_list_bots`, `grokbot_ask`, `grokbot_send` and `grokbot_read`.
+The server exposes five tools: `grokbot_list_bots`, `grokbot_ask`, `grokbot_send`, `grokbot_read` and `grokbot_usage`.
 
 **Claude Code**
 
@@ -122,6 +123,13 @@ Grok Bot is an Electron app. `grokbot launch` restarts it with Chromium's `--rem
 1. Opens the Bot's conversation from the sidebar (`data-agent-id`).
 2. Types into the message box and presses Enter.
 3. Watches the transcript (`data-role="assistant"` rows) and the Bot's activity marks (`data-grok-state`: `working`, `running` while it uses tools, `streaming` while it types) until every mark has been `idle` for a few seconds.
+
+`grokbot usage` calls the read-only getter that the app's own settings card uses, so it returns the same "Weekly usage limit" numbers.
+
+```console
+$ grokbot usage
+Weekly usage: 1.37% used · resets 10/22/2026, 11:44:33 AM (in 4 days) · plan: X Premium+
+```
 
 Messages go through the app's normal send path, so they show up in your conversation history like any message you typed. The bridge makes no network calls of its own and has no runtime dependencies.
 

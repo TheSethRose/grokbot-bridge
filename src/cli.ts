@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { launch, restore } from "./app.ts";
-import { ask, listBots, read, send, status } from "./bot.ts";
+import { ask, listBots, read, send, status, type Usage, usage } from "./bot.ts";
 import { CDP, cdpPort, listTargets } from "./cdp.ts";
 import { serveMcp } from "./mcp.ts";
 import { VERSION } from "./version.ts";
@@ -12,6 +12,7 @@ Usage:
   grokbot send <bot> <message...>   Send without waiting
   grokbot read <bot>                Show recent messages in a conversation
   grokbot bots                      List your Bots
+  grokbot usage                     Show your weekly usage limit
   grokbot status                    Check the connection
   grokbot launch                    (Re)start Grok Bot with the local debug port
   grokbot restore                   Restart Grok Bot normally (closes the port)
@@ -59,6 +60,23 @@ function positiveNumber(v: string | boolean | undefined, name: string, fallback:
   return n;
 }
 
+function formatUsage(u: Usage): string {
+  const parts = [`Weekly usage: ${u.percentUsed}% used`];
+  if (u.resetsAt) {
+    const days = Math.max(0, Math.round((Date.parse(u.resetsAt) - Date.now()) / 86_400_000));
+    parts.push(
+      `resets ${new Date(u.resetsAt).toLocaleString()} (${days === 0 ? "within a day" : `in ${days} day${days === 1 ? "" : "s"}`})`,
+    );
+  }
+  if (u.plan) parts.push(`plan: ${u.plan}`);
+  if (!u.hasAvailableUsage) parts.push("limit reached");
+  if (u.onDemand?.enabled) {
+    const limit = u.onDemand.limitCents == null ? "no limit" : `$${(u.onDemand.limitCents / 100).toFixed(2)} limit`;
+    parts.push(`on-demand: $${(u.onDemand.usedCents / 100).toFixed(2)} spent, ${limit}`);
+  }
+  return parts.join(" · ");
+}
+
 async function withApp<T>(fn: (cdp: CDP) => Promise<T>): Promise<T> {
   const { restarted } = await launch();
   if (restarted) console.error("[grokbot] Restarted Grok Bot with the local debug port.");
@@ -97,7 +115,7 @@ async function main() {
         return out(
           { connected: true, port, ...s },
           () =>
-            `Connected on port ${port}. ${s.bots.length} Bot(s): ${s.bots.map((b) => b.name).join(", ")}${s.busy ? " · a Bot is working" : ""}`,
+            `Connected on port ${port}. ${s.bots.length} Bot(s): ${s.bots.map((b) => b.name).join(", ")}${s.busy ? " · a Bot is working" : ""}${s.usage ? `\n${formatUsage(s.usage)}` : ""}`,
         );
       } finally {
         cdp.close();
@@ -106,6 +124,10 @@ async function main() {
     case "bots": {
       const bots = await withApp(listBots);
       return out(bots, () => bots.map((b) => `${b.active ? "*" : " "} ${b.label}  (${b.id})`).join("\n"));
+    }
+    case "usage": {
+      const u = await withApp(usage);
+      return out(u, () => formatUsage(u));
     }
     case "read": {
       const [bot] = args;

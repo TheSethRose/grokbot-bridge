@@ -194,9 +194,51 @@ export async function ask(cdp: CDP, botQuery: string, text: string, opts: AskOpt
   return { bot, status: "timeout", messages: [...replies.values()], elapsedMs: Date.now() - t0 };
 }
 
+export type Usage = {
+  /** Share of the weekly included usage spent, 0–100. */
+  percentUsed: number;
+  resetsAt: string | null;
+  plan: string | null;
+  hasAvailableUsage: boolean;
+  onDemand: { enabled: boolean; usedCents: number; limitCents: number | null } | null;
+};
+
+/** The weekly usage limit shown in Grok Bot's settings, read from the app's own read-only getter. */
+export async function usage(cdp: CDP): Promise<Usage> {
+  type Summary = {
+    sandUsagePercent?: number;
+    sandUsageResetTimestampMs?: number;
+    grokPlanLabel?: string;
+    hasAvailableUsage?: boolean;
+    onDemand?: { usedCents?: number; limitCents?: number | null } | null;
+    onDemandSettings?: { enabled?: boolean };
+  };
+  const get = () =>
+    cdp.call<Summary | null>(
+      `async () => { const m = window.desktop?.main; return m?.getCursorUsageSummary ? await m.getCursorUsageSummary() : null; }`,
+    );
+  // The app fetches this from its backend, which sometimes answers with a transient 5xx.
+  const s = await get().catch(async (e) => {
+    await sleep(2000);
+    return get().catch(() => {
+      throw new Error(`Couldn't read usage from Grok Bot: ${(e as Error).message}`);
+    });
+  });
+  if (!s || typeof s.sandUsagePercent !== "number") throw new Error("Couldn't read usage. This Grok Bot version may not support it.");
+  return {
+    percentUsed: Math.round(s.sandUsagePercent * 100) / 100,
+    resetsAt: s.sandUsageResetTimestampMs ? new Date(s.sandUsageResetTimestampMs).toISOString() : null,
+    plan: s.grokPlanLabel ?? null,
+    hasAvailableUsage: s.hasAvailableUsage !== false,
+    onDemand: s.onDemand
+      ? { enabled: !!s.onDemandSettings?.enabled, usedCents: s.onDemand.usedCents ?? 0, limitCents: s.onDemand.limitCents ?? null }
+      : null,
+  };
+}
+
 /** Basic health info for `grokbot status`. */
-export async function status(cdp: CDP): Promise<{ bots: Bot[]; busy: boolean }> {
+export async function status(cdp: CDP): Promise<{ bots: Bot[]; busy: boolean; usage: Usage | null }> {
   const bots = await listBots(cdp);
   const busy = await cdp.call<boolean>(`(sel) => !!document.querySelector(sel)`, SEL.busy);
-  return { bots, busy };
+  return { bots, busy, usage: await usage(cdp).catch(() => null) };
 }

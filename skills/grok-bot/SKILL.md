@@ -14,10 +14,11 @@ grokbot bots                                  # list Bots: name, role, id
 grokbot ask <bot> "<message>" [--timeout 300] [--json]   # send and wait for the reply
 grokbot send <bot> "<message>"                # send without waiting
 grokbot read <bot> [--limit 10] [--json]      # recent messages in that conversation
-grokbot status                                # connection check
+grokbot usage [--json]                        # weekly usage limit: % used, reset time
+grokbot status                                # connection check (includes usage)
 ```
 
-The same actions are available as MCP tools: `grokbot_list_bots`, `grokbot_ask`, `grokbot_send`, `grokbot_read`. Use `-` as the message to read it from stdin, which is handy for long briefs.
+The same actions are available as MCP tools: `grokbot_list_bots`, `grokbot_ask`, `grokbot_send`, `grokbot_read`, `grokbot_usage`. Use `-` as the message to read it from stdin, which is handy for long briefs.
 
 - The first call may restart the Grok Bot app with a loopback-only debug port (`grokbot launch`). Cloud work isn't interrupted, but tell the user the first time it happens. `grokbot restore` restarts the app normally.
 - `ask` returns when the Bot has been idle for a few seconds. Bots often send an acknowledgment first ("On it, I'll report back") and then keep working. If the result shows status `timeout`, or the reply is only an acknowledgment, wait and run `grokbot read <bot>` later. Don't resend the request.
@@ -31,6 +32,8 @@ Give the Bot work that needs its own computer or that should keep going without 
 - **Long browser tasks:** filling portals, comparing products, collecting data across many sites, following up on a page later.
 - **Monitoring:** "Check this every morning and message me if it changes." Bots can turn a stable task into a routine.
 - **Connected apps:** email, calendar, Slack and other connectors the user has granted the Bot.
+
+Bot work counts against the user's weekly usage limit. Run `grokbot usage` before a long or recurring job and again after it, and tell the user what it cost (for example "1.4% → 3.0%"). If usage is above about 80%, or the limit is reached, ask before starting more Bot work.
 
 Keep work you can do faster yourself, such as local code, files and quick lookups, in this session.
 

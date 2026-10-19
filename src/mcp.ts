@@ -2,7 +2,7 @@
 // Newline-delimited JSON-RPC 2.0, no SDK dependency.
 import { createInterface } from "node:readline";
 import { launch } from "./app.ts";
-import { ask, listBots, read, send } from "./bot.ts";
+import { ask, listBots, read, send, usage } from "./bot.ts";
 import { CDP } from "./cdp.ts";
 import { VERSION } from "./version.ts";
 
@@ -37,6 +37,12 @@ const TOOLS = [
       required: ["bot", "message"],
       additionalProperties: false,
     },
+  },
+  {
+    name: "grokbot_usage",
+    description:
+      "Get the user's Grok Bot weekly usage limit: percent used, when it resets, plan, and on-demand spend. Check it before handing a Bot long or heavy work.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "grokbot_read",
@@ -84,6 +90,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     }
     case "grokbot_send":
       return withApp((c) => send(c, str("bot"), str("message")));
+    case "grokbot_usage":
+      return withApp((c) => usage(c));
     case "grokbot_read":
       return withApp((c) => read(c, str("bot"), Number(args.limit ?? 10)));
     default:
