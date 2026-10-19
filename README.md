@@ -38,9 +38,11 @@ Your coding agent is good at code. Your Grok Bot is good at things that need a b
 ## Install
 
 ```bash
-npm install -g github:TheSethRose/grokbot-bridge
+npm install -g https://github.com/TheSethRose/grokbot-bridge/archive/refs/heads/main.tar.gz
 grokbot status
 ```
+
+<sub>Use the tarball URL. With `npm install -g github:…`, npm 11 can link the global package to a temporary clone that it then deletes.</sub>
 
 Or run it without installing: `npx -y github:TheSethRose/grokbot-bridge status`.
 
@@ -156,7 +158,7 @@ bun run check               # tsc + Biome
 bun run build               # bundle to dist/cli.js (Node 22+)
 ```
 
-`dist/cli.js` is committed so `npm install -g github:…` works without a build step. Rebuild it before you commit.
+`dist/cli.js` is committed so installing from GitHub works without a build step. Rebuild it before you commit.
 
 ## License
 
