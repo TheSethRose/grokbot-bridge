@@ -4,6 +4,7 @@ import { createInterface } from "node:readline";
 import { launch } from "./app.ts";
 import { ask, listBots, read, send, usage } from "./bot.ts";
 import { CDP } from "./cdp.ts";
+import { createBot, deleteBot, updateBot } from "./roster.ts";
 import { VERSION } from "./version.ts";
 
 const TOOLS = [
@@ -35,6 +36,48 @@ const TOOLS = [
       type: "object",
       properties: { bot: { type: "string" }, message: { type: "string" } },
       required: ["bot", "message"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "grokbot_create_bot",
+    description:
+      "Create a new Grok Bot. It starts working when it gets its first message (use grokbot_ask). Each Bot uses the user's Grok Bot usage, so only create one when the user asked for it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Name shown in the sidebar" },
+        description: { type: "string", description: "Optional: what the Bot is for" },
+      },
+      required: ["name"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "grokbot_update_bot",
+    description: "Rename a Grok Bot or change its description. Omitted fields stay the same.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot: { type: "string", description: "Current Bot name or id" },
+        name: { type: "string", description: "New name" },
+        description: { type: "string", description: "New description" },
+      },
+      required: ["bot"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "grokbot_delete_bot",
+    description:
+      "Permanently delete a Grok Bot and its conversation. Only use when the user explicitly asked to delete this Bot. 'bot' must be the exact name or id, and 'confirm' must repeat it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot: { type: "string", description: "Exact Bot name or id" },
+        confirm: { type: "string", description: "Repeat the same value as 'bot' to confirm" },
+      },
+      required: ["bot", "confirm"],
       additionalProperties: false,
     },
   },
@@ -80,6 +123,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     if (typeof v !== "string" || !v.trim()) throw new Error(`"${k}" is required`);
     return v;
   };
+  const opt = (k: string) => (typeof args[k] === "string" ? (args[k] as string) : undefined);
   switch (name) {
     case "grokbot_list_bots":
       return withApp((c) => listBots(c));
@@ -90,6 +134,17 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     }
     case "grokbot_send":
       return withApp((c) => send(c, str("bot"), str("message")));
+    case "grokbot_create_bot":
+      return withApp((c) => createBot(c, { name: str("name"), description: opt("description") }));
+    case "grokbot_update_bot": {
+      const name = opt("name");
+      const description = opt("description");
+      if (name === undefined && description === undefined) throw new Error('Pass "name" or "description" to change.');
+      return withApp((c) => updateBot(c, str("bot"), { name, description }));
+    }
+    case "grokbot_delete_bot":
+      if (str("confirm") !== str("bot")) throw new Error('"confirm" must repeat the "bot" value exactly.');
+      return withApp((c) => deleteBot(c, str("bot")));
     case "grokbot_usage":
       return withApp((c) => usage(c));
     case "grokbot_read":

@@ -3,6 +3,7 @@ import { launch, restore } from "./app.ts";
 import { ask, listBots, read, send, status, type Usage, usage } from "./bot.ts";
 import { CDP, cdpPort, listTargets } from "./cdp.ts";
 import { serveMcp } from "./mcp.ts";
+import { createBot, deleteBot, updateBot } from "./roster.ts";
 import { VERSION } from "./version.ts";
 
 const USAGE = `grokbot ${VERSION} — talk to your Grok Bots from the terminal or any agent
@@ -12,6 +13,9 @@ Usage:
   grokbot send <bot> <message...>   Send without waiting
   grokbot read <bot>                Show recent messages in a conversation
   grokbot bots                      List your Bots
+  grokbot create <name>             Create a Bot (--description <text>)
+  grokbot update <bot>              Rename a Bot or change its description (--name, --description)
+  grokbot delete <bot> --yes        Permanently delete a Bot (exact name or id)
   grokbot usage                     Show your weekly usage limit
   grokbot status                    Check the connection
   grokbot launch                    (Re)start Grok Bot with the local debug port
@@ -22,6 +26,9 @@ Options:
   --timeout <sec>   ask: max seconds to wait (default 300)
   --settle <sec>    ask: idle seconds before the reply counts as finished (default 8)
   --limit <n>       read: number of messages (default 10)
+  --name <text>     update: new name
+  --description <t> create/update: what the Bot is for
+  --yes             delete: confirm deleting the Bot
   --json            Machine-readable output
   --quiet           ask: don't stream progress to stderr
   -v, --version     Print version
@@ -35,8 +42,8 @@ function parse(argv: string[]) {
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--json" || a === "--quiet") flags[a.slice(2)] = true;
-    else if (a === "--timeout" || a === "--limit" || a === "--settle") flags[a.slice(2)] = argv[++i] ?? "";
+    if (a === "--json" || a === "--quiet" || a === "--yes") flags[a.slice(2)] = true;
+    else if (["--timeout", "--limit", "--settle", "--name", "--description"].includes(a)) flags[a.slice(2)] = argv[++i] ?? "";
     else if (a === "-h" || a === "--help") flags.help = true;
     else if (a === "-v" || a === "--version") flags.version = true;
     else rest.push(a);
@@ -52,6 +59,8 @@ async function readMessage(parts: string[]): Promise<string> {
   }
   return parts.join(" ").trim();
 }
+
+const str = (v: string | boolean | undefined) => (typeof v === "string" ? v : undefined);
 
 function positiveNumber(v: string | boolean | undefined, name: string, fallback: number): number {
   if (v === undefined) return fallback;
@@ -128,6 +137,29 @@ async function main() {
     case "usage": {
       const u = await withApp(usage);
       return out(u, () => formatUsage(u));
+    }
+    case "create": {
+      const name = args.join(" ").trim();
+      if (!name) throw new Error("Usage: grokbot create <name> [--description <text>]");
+      const b = await withApp((c) => createBot(c, { name, description: str(flags.description) }));
+      return out(b, () => `Created ${b.name} (${b.id}). It starts working when you send it a message.`);
+    }
+    case "update": {
+      const bot = args.join(" ").trim();
+      const name = str(flags.name);
+      const description = str(flags.description);
+      if (!bot || (name === undefined && description === undefined)) {
+        throw new Error("Usage: grokbot update <bot> [--name <new name>] [--description <text>]");
+      }
+      const b = await withApp((c) => updateBot(c, bot, { name, description }));
+      return out(b, () => `Updated ${b.name}${b.description ? ` — ${b.description}` : ""}`);
+    }
+    case "delete": {
+      const bot = args.join(" ").trim();
+      if (!bot) throw new Error("Usage: grokbot delete <bot> --yes");
+      if (!flags.yes) throw new Error(`This permanently deletes "${bot}" and its conversation. Run again with --yes to confirm.`);
+      const b = await withApp((c) => deleteBot(c, bot));
+      return out(b, () => `Deleted ${b.name}.`);
     }
     case "read": {
       const [bot] = args;

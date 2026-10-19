@@ -27,7 +27,7 @@ Your coding agent is good at code. Your Grok Bot is good at things that need a b
 
 - **Claude Code → Grok Bot:** "Ask Chief to collect B-roll posts for this transcript and send me the links."
 - **Scripts → Grok Bot:** `grokbot ask Chief "$(cat brief.md)" --json | jq …`
-- **Any MCP client:** tools for `ask`, `send`, `read`, `list_bots` and `usage`.
+- **Any MCP client:** tools to message Bots, read replies, check usage, and create, rename or delete Bots.
 
 ## Requirements
 
@@ -65,6 +65,9 @@ grokbot read Chief             # recent messages in that conversation
 | `grokbot send <bot> <message…>` | Send without waiting |
 | `grokbot read <bot> [--limit N]` | Print recent messages in the conversation |
 | `grokbot bots` | List Bots with their role and id |
+| `grokbot create <name> [--description <text>]` | Create a Bot. It starts working when you send it a message |
+| `grokbot update <bot> [--name <new>] [--description <text>]` | Rename a Bot or change its description |
+| `grokbot delete <bot> --yes` | Permanently delete a Bot and its conversation. Needs the exact name or id |
 | `grokbot usage` | Show your weekly usage limit: percent used, reset time, plan, on-demand spend |
 | `grokbot status` | Check the connection and show usage |
 | `grokbot launch` | Restart Grok Bot with the debug port (127.0.0.1 only) |
@@ -79,7 +82,7 @@ Options: `--json` for machine-readable output, `--timeout <sec>` for `ask` (defa
 
 ### MCP (Claude Code, Cursor, Codex and others)
 
-The server exposes five tools: `grokbot_list_bots`, `grokbot_ask`, `grokbot_send`, `grokbot_read` and `grokbot_usage`.
+The server exposes eight tools: `grokbot_list_bots`, `grokbot_ask`, `grokbot_send`, `grokbot_read`, `grokbot_usage`, `grokbot_create_bot`, `grokbot_update_bot` and `grokbot_delete_bot`. `grokbot_delete_bot` requires a `confirm` argument that repeats the Bot's exact name.
 
 **Claude Code**
 
@@ -131,6 +134,8 @@ $ grokbot usage
 Weekly usage: 1.37% used · resets 10/22/2026, 11:44:33 AM (in 4 days) · plan: X Premium+
 ```
 
+`create`, `update` and `delete` call the same Bot-list client the app's own New Bot, rename and delete actions use. Edits are saved on the Bot's cloud computer, which the app pauses while nobody is at the Mac. The bridge first sends the app's own "user is here" signal, the same one clicking into a message box sends. The main Bot can't be deleted.
+
 Messages go through the app's normal send path, so they show up in your conversation history like any message you typed. The bridge makes no network calls of its own and has no runtime dependencies.
 
 ## Security
@@ -154,7 +159,7 @@ Environment variables: `GROKBOT_CDP_PORT` (default `9333`) and `GROKBOT_APP` (pa
 - **App updates can break it.** The bridge relies on the app's page structure. All selectors live at the top of [`src/bot.ts`](src/bot.ts), so fixes are usually small. Please open an issue with your Grok Bot version.
 - **One conversation at a time.** Calls drive one shared window and are serialized. Switching conversations in the app during an `ask` stops it with status `interrupted`.
 - **Recent history only.** The transcript is virtualized, so `read` returns what the app has rendered, usually the last 10–20 messages.
-- **Bots must be in the sidebar.** Hidden Bots can't be selected.
+- **Bots must be in the sidebar to message them.** `update` and `delete` also work on hidden Bots.
 - Don't type in the Bot's message box while an `ask` is running.
 
 ## Development

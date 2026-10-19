@@ -63,7 +63,7 @@ export async function listBots(cdp: CDP): Promise<Bot[]> {
   return bots;
 }
 
-function matchBot(bots: Bot[], query: string): Bot {
+export function matchBot(bots: Bot[], query: string): Bot {
   const q = query.trim().toLowerCase();
   const exact = bots.filter((b) => b.id === query || b.name.toLowerCase() === q || b.label.toLowerCase() === q);
   if (exact.length === 1) return exact[0];
@@ -81,13 +81,14 @@ export async function openBot(cdp: CDP, query: string): Promise<Bot> {
   if (!bot.active) {
     await cdp.call(`(sel, id) => document.querySelector(sel + '[data-agent-id="' + id + '"]').click()`, SEL.agentItem, bot.id);
   }
+  // "open:<row keys>" once the Bot's conversation is showing; a new Bot has no rows yet.
   let last = "";
   let stable = 0;
   for (let i = 0; i < 40 && stable < 3; i++) {
     await sleep(200);
     const snap = await cdp.call<string>(
       `(sel, rowSel, prompt, id) => { const a = document.querySelector(sel + '[data-active="true"]');
-        return (a && a.dataset.agentId === id && document.querySelector(prompt)) ? [...document.querySelectorAll(rowSel)].map(r => r.dataset.rowKey).join("|") : "" }`,
+        return (a && a.dataset.agentId === id && document.querySelector(prompt)) ? "open:" + [...document.querySelectorAll(rowSel)].map(r => r.dataset.rowKey).join("|") : "" }`,
       SEL.agentItem,
       SEL.row,
       SEL.prompt,

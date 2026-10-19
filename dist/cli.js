@@ -242,7 +242,7 @@ async function openBot(cdp, query) {
   for (let i = 0;i < 40 && stable < 3; i++) {
     await sleep2(200);
     const snap = await cdp.call(`(sel, rowSel, prompt, id) => { const a = document.querySelector(sel + '[data-active="true"]');
-        return (a && a.dataset.agentId === id && document.querySelector(prompt)) ? [...document.querySelectorAll(rowSel)].map(r => r.dataset.rowKey).join("|") : "" }`, SEL.agentItem, SEL.row, SEL.prompt, bot.id);
+        return (a && a.dataset.agentId === id && document.querySelector(prompt)) ? "open:" + [...document.querySelectorAll(rowSel)].map(r => r.dataset.rowKey).join("|") : "" }`, SEL.agentItem, SEL.row, SEL.prompt, bot.id);
     stable = snap && snap === last ? stable + 1 : 0;
     last = snap;
   }
@@ -358,6 +358,105 @@ async function status(cdp) {
 // src/mcp.ts
 import { createInterface } from "node:readline";
 
+// src/roster.ts
+var sleep3 = (ms) => new Promise((r) => setTimeout(r, ms));
+var ROSTER = `(() => {
+  const start = document.querySelector(".sand-agent-item[data-agent-id]") || document.querySelector("button");
+  const key = start && Object.keys(start).find((k) => k.startsWith("__reactFiber"));
+  for (let f = key ? start[key] : null; f; f = f.return) {
+    const r = f.memoizedProps && f.memoizedProps.value && f.memoizedProps.value.roster;
+    if (r && typeof r.createAgent === "function" && typeof r.snapshots?.get === "function") return r;
+  }
+  return null;
+})()`;
+var NO_ROSTER = "Couldn't reach Grok Bot's Bot list. This app version may not support managing Bots.";
+var PAGE_OP = `async (op, arg) => {
+  const roster = ${ROSTER};
+  if (!roster) return { error: ${JSON.stringify(NO_ROSTER)} };
+  const rows = () => roster.snapshots.get().agents.rows.filter((r) => !r.isGroup);
+  const profile = (r) => ({ id: r.id, name: r.name, description: r.description || "", hidden: !!r.isHiddenFromSidebar, running: !!r.isRunning });
+  const message = (e) => (e && e.failure && e.failure.code ? e.failure.code + (e.message && e.message !== e.failure.code ? ": " + e.message : "") : String((e && e.message) || e));
+  const awake = async (id, fn) => {
+    for (let i = 0; ; i++) {
+      await Promise.resolve(window.desktop?.main?.signalBoxIntent?.({ agentId: id, intent: "composer_focus" })).catch(() => {});
+      try { return await fn(); } catch (e) {
+        if (i >= 8 || !(e && e.failure && e.failure.code === "sand-box-blocked")) throw e;
+        await new Promise((s) => setTimeout(s, 1500));
+      }
+    }
+  };
+  try {
+    if (op === "list") return { value: rows().map(profile) };
+    if (op === "create") {
+      const res = await roster.createAgent({ name: arg.name, description: arg.description, origin: "user", isKickstartRequested: false });
+      return { value: profile(res.agent) };
+    }
+    if (op === "update") {
+      await awake(arg.id, () => roster.updateAgent(arg.id, { name: arg.name, description: arg.description }));
+      const row = roster.snapshots.get().agentsById.get(arg.id);
+      return { value: row ? profile(row) : { id: arg.id, name: arg.name, description: arg.description, hidden: false, running: false } };
+    }
+    if (op === "delete") {
+      const res = await awake(arg.id, () => roster.deleteAgents([arg.id]));
+      const refused = (res && res.refusedAgentIds) || [], failed = (res && res.failedAgentIds) || [];
+      if (refused.includes(arg.id)) return { error: "Grok Bot refused to delete this Bot. Your main Bot can't be deleted; choose another main Bot in the app first." };
+      if (failed.includes(arg.id)) return { error: "Grok Bot couldn't delete this Bot. Try again, or delete it in the app." };
+      return { value: true };
+    }
+    return { error: "Unknown roster operation " + op };
+  } catch (e) {
+    return { error: message(e) };
+  }
+}`;
+async function op(cdp, name, arg) {
+  const r = await cdp.call(PAGE_OP, name, arg ?? null);
+  if (r.error !== undefined)
+    throw new Error(r.error);
+  return r.value;
+}
+function listProfiles(cdp) {
+  return op(cdp, "list");
+}
+async function findProfile(cdp, query) {
+  const profiles = await listProfiles(cdp);
+  const bots = profiles.map((p) => ({ id: p.id, name: p.name, label: p.name, active: false, preview: null }));
+  const bot = matchBot(bots, query);
+  return profiles.find((p) => p.id === bot.id);
+}
+async function createBot(cdp, input) {
+  const name = input.name.trim();
+  if (!name)
+    throw new Error("A Bot needs a name.");
+  const profiles = await listProfiles(cdp);
+  if (profiles.some((p) => p.name.toLowerCase() === name.toLowerCase()))
+    throw new Error(`You already have a Bot named "${name}".`);
+  const bot = await op(cdp, "create", { name, description: input.description?.trim() ?? "" });
+  for (let i = 0;i < 25; i++) {
+    if ((await listBots(cdp).catch(() => [])).some((b) => b.id === bot.id))
+      break;
+    await sleep3(400);
+  }
+  return bot;
+}
+async function updateBot(cdp, query, changes) {
+  const current = await findProfile(cdp, query);
+  const name = changes.name?.trim() || current.name;
+  const description = changes.description?.trim() ?? current.description;
+  if (name === current.name && description === current.description)
+    return current;
+  return op(cdp, "update", { id: current.id, name, description });
+}
+async function deleteBot(cdp, query) {
+  const q = query.trim().toLowerCase();
+  const matches = (await listProfiles(cdp)).filter((p) => p.id === query.trim() || p.name.toLowerCase() === q);
+  if (matches.length !== 1) {
+    throw new Error(matches.length ? `"${query}" matches several Bots. Use the Bot's id.` : `No Bot named exactly "${query}".`);
+  }
+  const [bot] = matches;
+  await op(cdp, "delete", { id: bot.id });
+  return { id: bot.id, name: bot.name };
+}
+
 // src/version.ts
 var VERSION = "0.1.0";
 
@@ -390,6 +489,46 @@ var TOOLS = [
       type: "object",
       properties: { bot: { type: "string" }, message: { type: "string" } },
       required: ["bot", "message"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "grokbot_create_bot",
+    description: "Create a new Grok Bot. It starts working when it gets its first message (use grokbot_ask). Each Bot uses the user's Grok Bot usage, so only create one when the user asked for it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Name shown in the sidebar" },
+        description: { type: "string", description: "Optional: what the Bot is for" }
+      },
+      required: ["name"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "grokbot_update_bot",
+    description: "Rename a Grok Bot or change its description. Omitted fields stay the same.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot: { type: "string", description: "Current Bot name or id" },
+        name: { type: "string", description: "New name" },
+        description: { type: "string", description: "New description" }
+      },
+      required: ["bot"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "grokbot_delete_bot",
+    description: "Permanently delete a Grok Bot and its conversation. Only use when the user explicitly asked to delete this Bot. 'bot' must be the exact name or id, and 'confirm' must repeat it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot: { type: "string", description: "Exact Bot name or id" },
+        confirm: { type: "string", description: "Repeat the same value as 'bot' to confirm" }
+      },
+      required: ["bot", "confirm"],
       additionalProperties: false
     }
   },
@@ -431,6 +570,7 @@ async function callTool(name, args) {
       throw new Error(`"${k}" is required`);
     return v;
   };
+  const opt = (k) => typeof args[k] === "string" ? args[k] : undefined;
   switch (name) {
     case "grokbot_list_bots":
       return withApp((c) => listBots(c));
@@ -441,6 +581,19 @@ async function callTool(name, args) {
     }
     case "grokbot_send":
       return withApp((c) => send(c, str("bot"), str("message")));
+    case "grokbot_create_bot":
+      return withApp((c) => createBot(c, { name: str("name"), description: opt("description") }));
+    case "grokbot_update_bot": {
+      const name2 = opt("name");
+      const description = opt("description");
+      if (name2 === undefined && description === undefined)
+        throw new Error('Pass "name" or "description" to change.');
+      return withApp((c) => updateBot(c, str("bot"), { name: name2, description }));
+    }
+    case "grokbot_delete_bot":
+      if (str("confirm") !== str("bot"))
+        throw new Error('"confirm" must repeat the "bot" value exactly.');
+      return withApp((c) => deleteBot(c, str("bot")));
     case "grokbot_usage":
       return withApp((c) => usage(c));
     case "grokbot_read":
@@ -504,6 +657,9 @@ Usage:
   grokbot send <bot> <message...>   Send without waiting
   grokbot read <bot>                Show recent messages in a conversation
   grokbot bots                      List your Bots
+  grokbot create <name>             Create a Bot (--description <text>)
+  grokbot update <bot>              Rename a Bot or change its description (--name, --description)
+  grokbot delete <bot> --yes        Permanently delete a Bot (exact name or id)
   grokbot usage                     Show your weekly usage limit
   grokbot status                    Check the connection
   grokbot launch                    (Re)start Grok Bot with the local debug port
@@ -514,6 +670,9 @@ Options:
   --timeout <sec>   ask: max seconds to wait (default 300)
   --settle <sec>    ask: idle seconds before the reply counts as finished (default 8)
   --limit <n>       read: number of messages (default 10)
+  --name <text>     update: new name
+  --description <t> create/update: what the Bot is for
+  --yes             delete: confirm deleting the Bot
   --json            Machine-readable output
   --quiet           ask: don't stream progress to stderr
   -v, --version     Print version
@@ -526,9 +685,9 @@ function parse(argv) {
   const rest = [];
   for (let i = 0;i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--json" || a === "--quiet")
+    if (a === "--json" || a === "--quiet" || a === "--yes")
       flags[a.slice(2)] = true;
-    else if (a === "--timeout" || a === "--limit" || a === "--settle")
+    else if (["--timeout", "--limit", "--settle", "--name", "--description"].includes(a))
       flags[a.slice(2)] = argv[++i] ?? "";
     else if (a === "-h" || a === "--help")
       flags.help = true;
@@ -548,6 +707,7 @@ async function readMessage(parts) {
   }
   return parts.join(" ").trim();
 }
+var str = (v) => typeof v === "string" ? v : undefined;
 function positiveNumber(v, name, fallback) {
   if (v === undefined)
     return fallback;
@@ -621,6 +781,32 @@ ${formatUsage(s.usage)}` : ""}`);
     case "usage": {
       const u = await withApp2(usage);
       return out(u, () => formatUsage(u));
+    }
+    case "create": {
+      const name = args.join(" ").trim();
+      if (!name)
+        throw new Error("Usage: grokbot create <name> [--description <text>]");
+      const b = await withApp2((c) => createBot(c, { name, description: str(flags.description) }));
+      return out(b, () => `Created ${b.name} (${b.id}). It starts working when you send it a message.`);
+    }
+    case "update": {
+      const bot = args.join(" ").trim();
+      const name = str(flags.name);
+      const description = str(flags.description);
+      if (!bot || name === undefined && description === undefined) {
+        throw new Error("Usage: grokbot update <bot> [--name <new name>] [--description <text>]");
+      }
+      const b = await withApp2((c) => updateBot(c, bot, { name, description }));
+      return out(b, () => `Updated ${b.name}${b.description ? ` — ${b.description}` : ""}`);
+    }
+    case "delete": {
+      const bot = args.join(" ").trim();
+      if (!bot)
+        throw new Error("Usage: grokbot delete <bot> --yes");
+      if (!flags.yes)
+        throw new Error(`This permanently deletes "${bot}" and its conversation. Run again with --yes to confirm.`);
+      const b = await withApp2((c) => deleteBot(c, bot));
+      return out(b, () => `Deleted ${b.name}.`);
     }
     case "read": {
       const [bot] = args;
