@@ -1,0 +1,45 @@
+{
+  "name": "grokbot-bridge",
+  "version": "0.1.0",
+  "description": "Unofficial bridge that lets Claude Code, Cursor, Codex and scripts talk to your Grok Bots: a CLI and an MCP server that drive the Grok Bot desktop app locally.",
+  "type": "module",
+  "bin": {
+    "grokbot": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "bun build src/cli.ts --target=node --outfile=dist/cli.js && chmod +x dist/cli.js",
+    "dev": "bun src/cli.ts",
+    "check": "tsc --noEmit && biome check .",
+    "format": "biome check --write ."
+  },
+  "keywords": [
+    "grok",
+    "grok-bot",
+    "xai",
+    "mcp",
+    "claude-code",
+    "cursor",
+    "agents",
+    "cdp",
+    "electron"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheSethRose/grokbot-bridge.git"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}
