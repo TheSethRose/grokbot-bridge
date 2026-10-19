@@ -31,11 +31,13 @@ export class CDP {
   private ws: WebSocket;
   private nextId = 0;
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private bindings = new Map<string, (payload: string) => void>();
 
   private constructor(ws: WebSocket) {
     this.ws = ws;
     ws.addEventListener("message", (ev) => {
       const msg = JSON.parse(String(ev.data));
+      if (msg.method === "Runtime.bindingCalled") return this.bindings.get(msg.params.name)?.(msg.params.payload);
       const p = msg.id ? this.pending.get(msg.id) : undefined;
       if (!p) return;
       this.pending.delete(msg.id);
@@ -85,10 +87,15 @@ export class CDP {
     return this.eval<T>(`(${fn})(...${JSON.stringify(args)})`);
   }
 
-  async pressKey(key: "Enter", shift = false): Promise<void> {
-    const base = { key, code: key, windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers: shift ? 8 : 0 };
-    await this.send("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: shift ? undefined : "\r" });
-    await this.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+  /**
+   * Add a page function `window[name](string)` whose calls arrive at `fn`, so page code can
+   * push events while a long evaluation is still running. Returns the name to hand to the page.
+   */
+  async bind(fn: (payload: string) => void): Promise<string> {
+    const name = `__grokbot_${process.pid}_${this.bindings.size}`;
+    this.bindings.set(name, fn);
+    await this.send("Runtime.addBinding", { name });
+    return name;
   }
 
   close(): void {

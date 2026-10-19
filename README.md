@@ -27,7 +27,7 @@ Your coding agent is good at code. Your Grok Bot is good at things that need a b
 
 - **Claude Code → Grok Bot:** "Ask Chief to collect B-roll posts for this transcript and send me the links."
 - **Scripts → Grok Bot:** `grokbot ask Chief "$(cat brief.md)" --json | jq …`
-- **Any MCP client:** tools to message Bots, read replies, check usage, and create, rename or delete Bots.
+- **Any MCP client:** tools to message Bots (with files), wait for and read replies, stop a Bot, check usage, and create, rename or delete Bots.
 
 ## Requirements
 
@@ -55,16 +55,19 @@ grokbot ask Chief "What can you help me with?"
 grokbot read Chief             # recent messages in that conversation
 ```
 
-`ask`, `send`, `read` and `bots` call `launch` for you if the app isn't connected yet.
+Every command except `status` and `restore` calls `launch` for you if the app isn't connected yet.
 
 ## CLI
 
 | Command | What it does |
 | --- | --- |
-| `grokbot ask <bot> <message…>` | Send a message and wait until the Bot goes idle, then print its replies |
-| `grokbot send <bot> <message…>` | Send without waiting |
-| `grokbot read <bot> [--limit N]` | Print recent messages in the conversation |
-| `grokbot bots` | List Bots with their role and id |
+| `grokbot ask <bot> <message…> [--file <path>]` | Send a message and wait until the Bot has finished, then print its replies |
+| `grokbot send <bot> <message…> [--file <path>]` | Send without waiting. Prints the message key |
+| `grokbot wait <bot> [--since <key>]` | Wait for the Bot to finish replying to your latest message (or the one at `--since`) |
+| `grokbot read <bot> [--limit N] [--since <key>]` | Print messages in the conversation: the last N, or everything after a key |
+| `grokbot watch [bot]` | Stream new replies and `working` / `idle` / `needs_input` changes, one line each |
+| `grokbot stop <bot>` | Interrupt what the Bot is doing, like the app's Stop button |
+| `grokbot bots` | List Bots with their id and whether each is working, needs your input or has unread messages |
 | `grokbot create <name> [--description <text>]` | Create a Bot. It starts working when you send it a message |
 | `grokbot update <bot> [--name <new>] [--description <text>]` | Rename a Bot or change its description |
 | `grokbot delete <bot> --yes` | Permanently delete a Bot and its conversation. Needs the exact name or id |
@@ -74,15 +77,33 @@ grokbot read Chief             # recent messages in that conversation
 | `grokbot restore` | Restart Grok Bot normally, closing the port |
 | `grokbot mcp` | Run as an MCP server over stdio |
 
-Options: `--json` for machine-readable output, `--timeout <sec>` for `ask` (default 300), `--settle <sec>` for how long a Bot must stay idle before `ask` returns (default 8), `--quiet` to stop progress lines on stderr. Pass `-` as the message to read it from stdin.
+Options: `--json` for machine-readable output, `--file <path>` to attach a file to `ask` or `send` (repeat it for several, 25 MB each), `--timeout <sec>` for `ask` (default 300) and `wait` (default 1800), `--settle <sec>` for how long a Bot must stay idle before its reply counts as finished (default 8), `--quiet` to stop progress lines on stderr. Pass `-` as the message to read it from stdin.
 
-`ask` exits with code `2` if the Bot is still working when the timeout hits. Bots often acknowledge first and report back minutes later, so use `grokbot read <bot>` to collect the rest.
+`ask` and `wait` exit with `0` when the Bot has finished, `2` if it's still working at the timeout, and `3` if it's waiting for you in the app (an approval card or a question). Bots often acknowledge first and report back minutes later; run `grokbot wait <bot>` again to keep waiting.
+
+### Getting told when a Bot replies
+
+You don't need to sleep and check. `wait` returns the moment the Bot finishes, so start it in the background and let your shell or agent tell you when it exits:
+
+```bash
+grokbot send Chief "$(cat brief.md)" --file data.csv   # prints the message key
+grokbot wait Chief --json > reply.json &               # returns when Chief is done
+```
+
+In Claude Code, run `grokbot ask …` or `grokbot wait …` as a background command; Claude is notified when it exits and reads the reply then. For a running feed across all Bots, `grokbot watch --json` prints one JSON object per event, which works with Claude Code's Monitor tool or any `while read` loop:
+
+```console
+$ grokbot watch --json
+{"type":"working","bot":"Chief","at":"2026-10-19T04:40:00.133Z"}
+{"type":"message","bot":"Chief","key":"t15s0","role":"assistant","kind":"send-message/text","text":"grokbot-bridge attachment check 7Q4K","links":[],"at":"2026-10-19T04:40:05.973Z"}
+{"type":"idle","bot":"Chief","at":"2026-10-19T04:40:33.275Z"}
+```
 
 ## Use it from your agent
 
 ### MCP (Claude Code, Cursor, Codex and others)
 
-The server exposes eight tools: `grokbot_list_bots`, `grokbot_ask`, `grokbot_send`, `grokbot_read`, `grokbot_usage`, `grokbot_create_bot`, `grokbot_update_bot` and `grokbot_delete_bot`. `grokbot_delete_bot` requires a `confirm` argument that repeats the Bot's exact name.
+The server exposes ten tools: `grokbot_list_bots`, `grokbot_ask`, `grokbot_send`, `grokbot_wait`, `grokbot_read`, `grokbot_stop`, `grokbot_usage`, `grokbot_create_bot`, `grokbot_update_bot` and `grokbot_delete_bot`. `grokbot_ask` and `grokbot_send` take an optional `files` list. `grokbot_delete_bot` requires a `confirm` argument that repeats the Bot's exact name.
 
 **Claude Code**
 
@@ -121,11 +142,12 @@ curl -fsSL https://raw.githubusercontent.com/TheSethRose/grokbot-bridge/main/ski
 your agent ──CLI / MCP──▶ grokbot-bridge ──Chrome DevTools Protocol (127.0.0.1)──▶ Grok Bot desktop app ──▶ your Bot's cloud computer
 ```
 
-Grok Bot is an Electron app. `grokbot launch` restarts it with Chromium's `--remote-debugging-port` bound to `127.0.0.1`. The bridge then works the app the way you would:
+Grok Bot is an Electron app. `grokbot launch` restarts it with Chromium's `--remote-debugging-port` bound to `127.0.0.1`. The bridge then uses the same in-app stores the app's own screens use:
 
-1. Opens the Bot's conversation from the sidebar (`data-agent-id`).
-2. Types into the message box and presses Enter.
-3. Watches the transcript (`data-role="assistant"` rows) and the Bot's activity marks (`data-grok-state`: `working`, `running` while it uses tools, `streaming` while it types) until every mark has been `idle` for a few seconds.
+- **Reading:** each Bot's transcript store holds its whole conversation as structured entries, so `read` works for any Bot without switching the conversation on screen.
+- **Sending:** messages and files go through the send queue the message box uses (files are staged first, the same way dragging a file onto the box does), so they show up in your history like anything you typed. The bridge never types into the message box, so your drafts are safe.
+- **Waiting:** `wait`, `ask` and `watch` subscribe to the Bot list and transcript change events. A Bot counts as finished when it hasn't been working, using tools or typing for the settle time. If it's blocked on an approval card, they return `needs_input` right away.
+- **Stopping:** `stop` calls the same interrupt as the Stop button, for every session the Bot is running.
 
 `grokbot usage` calls the read-only getter that the app's own settings card uses, so it returns the same "Weekly usage limit" numbers.
 
@@ -156,11 +178,9 @@ Environment variables: `GROKBOT_CDP_PORT` (default `9333`) and `GROKBOT_APP` (pa
 
 ## Limitations
 
-- **App updates can break it.** The bridge relies on the app's page structure. All selectors live at the top of [`src/bot.ts`](src/bot.ts), so fixes are usually small. Please open an issue with your Grok Bot version.
-- **One conversation at a time.** Calls drive one shared window and are serialized. Switching conversations in the app during an `ask` stops it with status `interrupted`.
-- **Recent history only.** The transcript is virtualized, so `read` returns what the app has rendered, usually the last 10–20 messages.
-- **Bots must be in the sidebar to message them.** `update` and `delete` also work on hidden Bots.
-- Don't type in the Bot's message box while an `ask` is running.
+- **App updates can break it.** The bridge relies on internal stores of the app's renderer. The lookups live in [`src/page.ts`](src/page.ts) and the field names in [`src/bot.ts`](src/bot.ts), so fixes are usually small. Please open an issue with your Grok Bot version.
+- **A Stop leaves no trace in the transcript.** A `wait` that is running when you stop a Bot returns with no messages, but one started afterwards can't tell a stopped message from one the Bot hasn't picked up yet, so it waits until its timeout.
+- The Bot's internal tool steps are left out of `read` and `wait`, as the app folds them away too.
 
 ## Development
 

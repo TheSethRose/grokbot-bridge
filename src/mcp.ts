@@ -2,7 +2,7 @@
 // Newline-delimited JSON-RPC 2.0, no SDK dependency.
 import { createInterface } from "node:readline";
 import { launch } from "./app.ts";
-import { ask, listBots, read, send, usage } from "./bot.ts";
+import { ask, listBots, read, send, stop, usage, wait } from "./bot.ts";
 import { CDP } from "./cdp.ts";
 import { createBot, deleteBot, updateBot } from "./roster.ts";
 import { VERSION } from "./version.ts";
@@ -10,18 +10,20 @@ import { VERSION } from "./version.ts";
 const TOOLS = [
   {
     name: "grokbot_list_bots",
-    description: "List the Grok Bots in the user's Grok Bot desktop app (name, role label, id, whether open).",
+    description:
+      "List the Grok Bots in the user's Grok Bot desktop app: name, description, id, and whether each is working, needs the user's input, or has unread messages.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "grokbot_ask",
     description:
-      "Send a message to a Grok Bot and wait for its reply. Bots run on a cloud computer with a browser and can research the web and X, use connected apps, and do multi-step work. Returns the Bot's reply messages. If the Bot is still working at the timeout, returns what it has so far with status 'timeout'; call grokbot_read later for the rest.",
+      "Send a message to a Grok Bot and wait for its reply. Bots run on a cloud computer with a browser and can research the web and X, use connected apps, and do multi-step work. Returns the Bot's reply messages and the sent message's key. Status 'timeout' means it's still working: call grokbot_wait with since=key. Status 'needs_input' means the Bot is waiting on the user in the app.",
     inputSchema: {
       type: "object",
       properties: {
         bot: { type: "string", description: "Bot name (e.g. 'Chief') or id" },
         message: { type: "string", description: "The message to send, written like a request to a teammate" },
+        files: { type: "array", items: { type: "string" }, description: "Optional absolute paths of local files to attach (25 MB each)" },
         timeout_seconds: { type: "number", description: "Max seconds to wait for replies (default 300, max 1800)" },
         settle_seconds: { type: "number", description: "Idle seconds before the reply counts as finished (default 8)" },
       },
@@ -31,13 +33,40 @@ const TOOLS = [
   },
   {
     name: "grokbot_send",
-    description: "Send a message to a Grok Bot without waiting for a reply. Use grokbot_read later to collect it.",
+    description:
+      "Send a message to a Grok Bot without waiting. Returns the message key; pass it to grokbot_wait or grokbot_read as 'since' to collect the reply.",
     inputSchema: {
       type: "object",
-      properties: { bot: { type: "string" }, message: { type: "string" } },
+      properties: {
+        bot: { type: "string" },
+        message: { type: "string" },
+        files: { type: "array", items: { type: "string" }, description: "Optional absolute paths of local files to attach" },
+      },
       required: ["bot", "message"],
       additionalProperties: false,
     },
+  },
+  {
+    name: "grokbot_wait",
+    description:
+      "Wait for a Grok Bot to finish replying (to the message at 'since', or the user's latest message) and return its replies. Event-driven, no polling. Returns status 'done', 'timeout' (still working) or 'needs_input' (waiting on the user in the app).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot: { type: "string" },
+        since: { type: "string", description: "Message key from grokbot_send or grokbot_ask" },
+        timeout_seconds: { type: "number", description: "Max seconds to wait (default 600, max 3600)" },
+        settle_seconds: { type: "number", description: "Idle seconds before the reply counts as finished (default 8)" },
+      },
+      required: ["bot"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "grokbot_stop",
+    description:
+      "Interrupt what a Grok Bot is doing, like the app's Stop button. Use when the user asks, or a task is clearly running away.",
+    inputSchema: { type: "object", properties: { bot: { type: "string" } }, required: ["bot"], additionalProperties: false },
   },
   {
     name: "grokbot_create_bot",
@@ -89,26 +118,30 @@ const TOOLS = [
   },
   {
     name: "grokbot_read",
-    description: "Read the most recent messages in a Grok Bot conversation.",
+    description:
+      "Read messages in a Grok Bot conversation without switching the app's view: the most recent ones, or everything after a message key.",
     inputSchema: {
       type: "object",
-      properties: { bot: { type: "string" }, limit: { type: "number", description: "Max messages (default 10)" } },
+      properties: {
+        bot: { type: "string" },
+        limit: { type: "number", description: "Max messages (default 10)" },
+        since: { type: "string", description: "Only messages after this key" },
+      },
       required: ["bot"],
       additionalProperties: false,
     },
   },
 ];
 
-// Calls are serialized: the bridge drives one shared app window.
-let queue: Promise<unknown> = Promise.resolve();
-function serialized<T>(fn: () => Promise<T>): Promise<T> {
-  const next = queue.then(fn, fn);
-  queue = next.catch(() => {});
-  return next;
-}
+// Calls read and write the app's stores, so they can run side by side. Only launching
+// (which may restart the app) must not overlap.
+let launching: Promise<unknown> | null = null;
 
 async function withApp<T>(fn: (cdp: CDP) => Promise<T>): Promise<T> {
-  await launch();
+  launching ??= launch().finally(() => {
+    launching = null;
+  });
+  await launching;
   const cdp = await CDP.connect();
   try {
     return await fn(cdp);
@@ -124,16 +157,31 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     return v;
   };
   const opt = (k: string) => (typeof args[k] === "string" ? (args[k] as string) : undefined);
+  const files = Array.isArray(args.files) ? args.files.map(String) : [];
+  const seconds = (k: string, def: number, min: number, max: number) => Math.min(Math.max(Number(args[k] ?? def) || def, min), max) * 1000;
   switch (name) {
     case "grokbot_list_bots":
       return withApp((c) => listBots(c));
-    case "grokbot_ask": {
-      const t = Math.min(Math.max(Number(args.timeout_seconds ?? 300), 10), 1800);
-      const settle = Math.min(Math.max(Number(args.settle_seconds ?? 8), 2), 120);
-      return withApp((c) => ask(c, str("bot"), str("message"), { timeoutMs: t * 1000, settleMs: settle * 1000 }));
-    }
+    case "grokbot_ask":
+      return withApp((c) =>
+        ask(c, str("bot"), opt("message") ?? "", {
+          files,
+          timeoutMs: seconds("timeout_seconds", 300, 10, 1800),
+          settleMs: seconds("settle_seconds", 8, 2, 120),
+        }),
+      );
     case "grokbot_send":
-      return withApp((c) => send(c, str("bot"), str("message")));
+      return withApp((c) => send(c, str("bot"), opt("message") ?? "", files));
+    case "grokbot_wait":
+      return withApp((c) =>
+        wait(c, str("bot"), {
+          since: opt("since"),
+          timeoutMs: seconds("timeout_seconds", 600, 10, 3600),
+          settleMs: seconds("settle_seconds", 8, 2, 120),
+        }),
+      );
+    case "grokbot_stop":
+      return withApp((c) => stop(c, str("bot")));
     case "grokbot_create_bot":
       return withApp((c) => createBot(c, { name: str("name"), description: opt("description") }));
     case "grokbot_update_bot": {
@@ -148,7 +196,9 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     case "grokbot_usage":
       return withApp((c) => usage(c));
     case "grokbot_read":
-      return withApp((c) => read(c, str("bot"), Number(args.limit ?? 10)));
+      return withApp((c) =>
+        read(c, str("bot"), { limit: args.limit === undefined ? undefined : Number(args.limit) || 10, since: opt("since") }),
+      );
     default:
       throw new Error(`Unknown tool ${name}`);
   }
@@ -187,7 +237,7 @@ export function serveMcp(): void {
           return reply({ tools: TOOLS });
         case "tools/call": {
           try {
-            const out = await serialized(() => callTool(params?.name ?? "", params?.arguments ?? {}));
+            const out = await callTool(params?.name ?? "", params?.arguments ?? {});
             return reply({ content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
           } catch (e) {
             return reply({ content: [{ type: "text", text: String((e as Error).message ?? e) }], isError: true });

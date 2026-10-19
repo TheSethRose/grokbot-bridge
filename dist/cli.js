@@ -35,10 +35,13 @@ class CDP {
   ws;
   nextId = 0;
   pending = new Map;
+  bindings = new Map;
   constructor(ws) {
     this.ws = ws;
     ws.addEventListener("message", (ev) => {
       const msg = JSON.parse(String(ev.data));
+      if (msg.method === "Runtime.bindingCalled")
+        return this.bindings.get(msg.params.name)?.(msg.params.payload);
       const p = msg.id ? this.pending.get(msg.id) : undefined;
       if (!p)
         return;
@@ -84,10 +87,11 @@ class CDP {
   call(fn, ...args) {
     return this.eval(`(${fn})(...${JSON.stringify(args)})`);
   }
-  async pressKey(key, shift = false) {
-    const base = { key, code: key, windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers: shift ? 8 : 0 };
-    await this.send("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: shift ? undefined : "\r" });
-    await this.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+  async bind(fn) {
+    const name = `__grokbot_${process.pid}_${this.bindings.size}`;
+    this.bindings.set(name, fn);
+    await this.send("Runtime.addBinding", { name });
+    return name;
   }
   close() {
     this.ws.close();
@@ -176,54 +180,224 @@ async function restore() {
 }
 
 // src/bot.ts
-var SEL = {
-  agentItem: ".sand-agent-item[data-agent-id]",
-  prompt: '.sand-prompt-field[aria-label="Prompt"], [role="textbox"].ProseMirror',
-  row: ".sand-transcript-row[data-row-key]",
-  busy: '[data-grok-state]:not([data-grok-state="idle"])'
-};
-var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
-var PAGE_LIST_BOTS = `(sel) => [...document.querySelectorAll(sel)].map((e) => {
-  const label = e.getAttribute("aria-label") || e.innerText.trim();
-  return { id: e.dataset.agentId, label, name: label.split(", ")[0].trim(), active: e.dataset.active === "true",
-    preview: e.getAttribute("aria-description") };
-})`;
-var PAGE_ROWS = `(rowSel) => {
-  const withLinks = (el) => {
-    let text = el.innerText.trim(), from = 0;
-    const links = [];
-    for (const a of el.querySelectorAll("a[href]")) {
-      const href = a.href, label = a.innerText.trim();
-      if (!/^https?:/.test(href)) continue;
-      links.push(href);
-      if (!label || label === href) continue;
-      const at = text.indexOf(label, from);
-      if (at < 0) continue;
-      const md = "[" + label + "](" + href + ")";
-      text = text.slice(0, at) + md + text.slice(at + label.length);
-      from = at + md.length;
+import { readFile, stat } from "node:fs/promises";
+import { basename } from "node:path";
+
+// src/page.ts
+function store(name, method) {
+  return `(() => {
+    for (const start of [document.querySelector(".sand-agent-item[data-agent-id]"), document.querySelector("button")]) {
+      const key = start && Object.keys(start).find((k) => k.startsWith("__reactFiber"));
+      for (let f = key ? start[key] : null; f; f = f.return) {
+        const s = f.memoizedProps && f.memoizedProps.value && f.memoizedProps.value[${JSON.stringify(name)}];
+        if (s && typeof s[${JSON.stringify(method)}] === "function") return s;
+      }
     }
-    return { text, links };
+    return null;
+  })()`;
+}
+var PAGE_ERROR = `(e) => (e && e.failure && e.failure.code ? e.failure.code + (e.message && e.message !== e.failure.code ? ": " + e.message : "") : String((e && e.message) || e))`;
+
+// src/bot.ts
+var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
+var LIB = `
+  const roster = ${store("roster", "createAgent")};
+  const transcript = ${store("transcript", "snapshotsFor")};
+  if (!roster || !transcript) throw new Error("Couldn't reach Grok Bot's conversations. Is the app signed in and showing its main window? This app version may also have changed.");
+  const errorText = ${PAGE_ERROR};
+  const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rows = () => roster.snapshots.get().agents.rows.filter((r) => !r.isGroup);
+  const rowOf = (id) => roster.snapshots.get().agentsById.get(id);
+  const busy = (r) => !!(r && (r.isRunning || r.isRunningTurn || r.isComposingMessage));
+  const iso = (ms) => (typeof ms === "number" && ms > 0 ? new Date(ms).toISOString() : null);
+  const toBot = (r) => ({ id: r.id, name: r.name, description: r.description || "", hidden: !!r.isHiddenFromSidebar,
+    running: busy(r), needsInput: r.awaitingUserResponse != null, unread: r.unreadCount || 0,
+    lastActivity: iso(r.lastActivityAt), preview: r.lastMessagePreview ?? null });
+  const snap = (id) => transcript.snapshotsFor(id).get();
+  const isUser = (e) => (e.kind === "message" && e.role === "user") || e.kind === "user-attachment";
+  // Tool-call rows are the Bot's internal steps; the app folds them away too.
+  const hidden = (e) => e.kind === "tool-call";
+  const urls = (t) => [...new Set((t.match(/https?:\\/\\/[^\\s<>()\\[\\]"']+/g) || []).map((u) => u.replace(/[.,;:!?]+$/, "")))];
+  const label = (o) => { for (const k of ["title", "summary", "text", "content", "prompt", "label", "name"]) if (typeof o[k] === "string" && o[k]) return " " + o[k].slice(0, 500); return ""; };
+  const toMessage = (e) => {
+    const m = e.message;
+    let role = "card", text;
+    if (e.kind === "message") { role = e.role === "user" ? "user" : "assistant"; text = e.content || ""; }
+    else if (e.kind === "user-attachment") { role = "user"; text = "[file] " + (e.file_name || e.file_path || ""); }
+    else if (e.kind === "send-message" && m && m.type === "text") { role = "assistant"; text = m.content || ""; }
+    else if (e.kind === "send-message" && m && m.type === "attachment") { role = "assistant"; text = "[attachment]" + label(m) + (m.url ? " " + m.url : ""); }
+    else if (e.kind === "send-message" && m && m.type === "widget" && m.widget) {
+      const opts = (m.widget.options || []).map((o) => o.label).filter(Boolean);
+      text = (m.widget.prompt || "[question]") + (opts.length ? "\\nOptions: " + opts.join(" / ") : "");
+    } else text = "[" + (m ? m.type : e.kind) + "]" + label(m || e);
+    text = text.trim();
+    const out = { key: e.id, role, kind: m ? e.kind + "/" + m.type : e.kind, text, links: urls(text), at: iso(e.timestampMs) };
+    return e.isStreaming ? { ...out, streaming: true } : out;
   };
-  return [...document.querySelectorAll(rowSel)].flatMap((r) => {
-    const key = r.dataset.rowKey;
-    if (key.endsWith(":timestamp")) return [];
-    const m = r.querySelector("[data-role]");
-    const role = m ? m.dataset.role : "card";
-    const prose = [...r.querySelectorAll(".sand-message-prose")].map(withLinks).filter((p) => p.text);
-    const body = prose.length ? { text: prose.map((p) => p.text).join("\\n\\n"), links: prose.flatMap((p) => p.links) } : withLinks(m || r);
-    return [{ key, role: role === "user" || role === "assistant" ? role : "card", text: body.text, links: [...new Set(body.links)] }];
-  });
+  // Load a Bot's transcript into the store (the app loads only the ones you open) and keep it live until release().
+  const open = async (id) => {
+    const release = transcript.observeEntries(id, () => {});
+    try {
+      if (snap(id).loadState !== "ready") transcript.load(id);
+      for (const t0 = Date.now(); snap(id).loadState !== "ready"; await pause(150)) {
+        const s = snap(id);
+        if (s.failure) throw new Error("Couldn't load the conversation: " + errorText(s.failure));
+        if (Date.now() - t0 > 20000) throw new Error("Timed out loading the conversation (" + s.loadState + ").");
+      }
+    } catch (e) { release(); throw e; }
+    return release;
+  };
+  const indexOf = (entries, key) => entries.findIndex((e) => e.id === key || (e.clientNonce != null && e.clientNonce === key));
+  // The CLI's heartbeat keeps long waits alive (without it, the CLI exited and the page cleans up)
+  // and drives their clock: the app's window timers are throttled while it's in the background.
+  const alive = (name) => !name || Date.now() - ((window.__grokbot || {})[name] || Date.now()) < 45000;
+  const onBeat = (name, fn) => { const g = (window.__grokbot = window.__grokbot || {}); g.ticks = g.ticks || {}; g.ticks[name] = fn; return () => { delete g.ticks[name]; delete g[name]; }; };
+  const emitter = (name) => (ev) => { try { if (name && typeof window[name] === "function") window[name](JSON.stringify(ev)); } catch {} };
+  const listen = (subscribable, fn) => { const u = subscribable.subscribe(fn); return typeof u === "function" ? u : () => {}; };
+`;
+var page = (args, body) => `async (${args}) => {${LIB}
+${body}
 }`;
+var PAGE_BOTS = page("", "return rows().map(toBot);");
+var PAGE_READ = page("id, limit, since", `const release = await open(id);
+  try {
+    const visible = () => snap(id).entries.filter((e) => !hidden(e));
+    if (since) {
+      const all = snap(id).entries, i = indexOf(all, since);
+      if (i < 0) throw new Error("No message with key " + since + " in this conversation.");
+      const after = all.slice(i + 1).filter((e) => !hidden(e)).map(toMessage);
+      return limit ? after.slice(-limit) : after;
+    }
+    for (let n = 0; n < 20 && visible().length < limit && snap(id).hasOlder; n++) await transcript.loadOlder(id);
+    return visible().slice(-limit).map(toMessage);
+  } finally { release(); }`);
+var PAGE_SEND = page("id, prompt, uploads", `const journal = ${store("sendJournal", "sendPrompt")};
+  const stager = ${store("desktop", "stageAttachmentFile")};
+  if (!journal) throw new Error("Couldn't reach Grok Bot's send queue. This app version may not support it.");
+  const release = await open(id);
+  try {
+    await Promise.resolve(window.desktop?.main?.signalBoxIntent?.({ agentId: id, intent: "composer_focus" })).catch(() => {});
+    const attachments = [];
+    for (const f of uploads) {
+      const bytes = Uint8Array.from(atob(f.data), (c) => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: f.type });
+      const staged = stager ? await stager.stageAttachmentFile({ filename: f.name, file: blob }) : await window.desktop.local.stageAttachmentFile(f.name, blob);
+      if (!staged || !staged.ok) throw new Error("Grok Bot wouldn't accept " + f.name + ": " + errorText((staged && (staged.error || staged.reason)) || "staging failed"));
+      attachments.push({ path: staged.path, name: f.name, size: bytes.length });
+    }
+    let nonce = null;
+    try {
+      await journal.sendPrompt({ agentId: id, prompt, attachments, onNonceAssigned: (n) => { nonce = n.nonce; } });
+    } catch (e) { throw new Error("Grok Bot didn't send the message: " + errorText(e)); }
+    for (let n = 0; n < 50; n++) {
+      const entry = snap(id).entries.find((e) => e.clientNonce === nonce);
+      if (entry) return entry.clientNonce;
+      await pause(100);
+    }
+    return nonce;
+  } finally { release(); }`);
+var PAGE_WAIT = page("id, since, timeoutMs, settleMs, beat, sink", `const emit = emitter(sink);
+  const release = await open(id);
+  const entries0 = snap(id).entries;
+  let anchor = since;
+  if (anchor && indexOf(entries0, anchor) < 0) { release(); throw new Error("No message with key " + anchor + " in this conversation."); }
+  if (!anchor) { const last = [...entries0].reverse().find(isUser); anchor = last ? (last.clientNonce || last.id) : null; }
+  return await new Promise((resolve) => {
+    const t0 = Date.now(), seen = new Map();
+    let lastBusy = 0, finished = false;
+    const stops = [];
+    const finish = (status) => {
+      if (finished) return;
+      finished = true;
+      stops.forEach((s) => s());
+      release();
+      resolve({ status, messages: [...seen.values()], elapsedMs: Date.now() - t0 });
+    };
+    const tick = () => {
+      if (finished) return;
+      const row = rowOf(id);
+      if (!row) return finish("done");
+      const all = snap(id).entries, i = anchor ? indexOf(all, anchor) : -1;
+      for (const e of i >= 0 ? all.slice(i + 1) : anchor ? [] : all) {
+        if (isUser(e) || hidden(e)) continue;
+        const m = toMessage(e), prev = seen.get(m.key);
+        if (prev && prev.text === m.text && !!prev.streaming === !!m.streaming) continue;
+        seen.set(m.key, m);
+        if (!m.streaming) emit(m);
+      }
+      if (row.awaitingUserResponse != null) return finish("needs_input");
+      const replies = [...seen.values()];
+      if (busy(row) || replies.some((m) => m.streaming)) lastBusy = Date.now();
+      // Done once idle for settleMs after replying, or after working without a reply (e.g. stopped).
+      else if (replies.length || lastBusy) {
+        const idleSince = Math.max(lastBusy, row.lastActivityAt || 0, ...replies.map((m) => Date.parse(m.at || "") || 0));
+        if (Date.now() - idleSince >= settleMs) return finish("done");
+      }
+      if (Date.now() - t0 >= timeoutMs || !alive(beat)) finish("timeout");
+    };
+    stops.push(listen(roster.snapshots, tick), listen(transcript.snapshotsFor(id), tick), onBeat(beat, tick));
+    const iv = setInterval(tick, 1000);
+    stops.push(() => clearInterval(iv));
+    tick();
+  });`);
+var PAGE_WATCH = page("only, settleMs, beat, sink", `const emit = emitter(sink);
+  const watched = new Map();
+  const now = () => new Date().toISOString();
+  const track = async (r) => {
+    if (watched.has(r.id)) return;
+    const w = { name: r.name, seen: new Map(), state: null, lastBusy: 0, release: () => {}, ready: false };
+    watched.set(r.id, w);
+    try { w.release = await open(r.id); } catch { return; }
+    for (const e of snap(r.id).entries) w.seen.set(e.id, toMessage(e).text);
+    w.state = r.awaitingUserResponse != null ? "needs_input" : busy(r) ? "working" : "idle";
+    w.ready = true;
+    stops.push(listen(transcript.snapshotsFor(r.id), tick));
+  };
+  const stops = [];
+  const tick = () => {
+    for (const r of rows()) {
+      if (only && r.id !== only) continue;
+      const w = watched.get(r.id);
+      if (!w) { track(r); continue; }
+      if (!w.ready) continue;
+      w.name = r.name;
+      for (const e of snap(r.id).entries) {
+        if (isUser(e) || hidden(e)) continue;
+        const m = toMessage(e);
+        if (m.streaming || w.seen.get(m.key) === m.text) continue;
+        w.seen.set(m.key, m.text);
+        emit({ type: "message", bot: r.name, ...m });
+      }
+      let state = r.awaitingUserResponse != null ? "needs_input" : busy(r) ? "working" : null;
+      if (state === "working") w.lastBusy = Date.now();
+      if (!state) state = w.state === "working" && Date.now() - w.lastBusy < settleMs ? "working" : "idle";
+      if (state !== w.state) { w.state = state; emit({ type: state, bot: r.name, at: now() }); }
+    }
+  };
+  stops.push(listen(roster.snapshots, tick), onBeat(beat, tick));
+  tick();
+  await new Promise((resolve) => {
+    const iv = setInterval(() => { if (!alive(beat)) { clearInterval(iv); resolve(); } }, 5000);
+  });
+  stops.forEach((s) => s());
+  for (const w of watched.values()) w.release();`);
+var PAGE_STOP = page("id", `const row = rowOf(id);
+  if (!busy(row)) return false;
+  const sessions = row.runningSessionIds || [];
+  try {
+    if (!sessions.length) await roster.interruptAgentRun({ agentId: id });
+    else await Promise.allSettled(sessions.map((s) => roster.interruptAgentRun({ agentId: id, sessionId: s })));
+  } catch (e) { throw new Error("Grok Bot couldn't stop the Bot: " + errorText(e)); }
+  return true;`);
 async function listBots(cdp) {
-  const bots = await cdp.call(PAGE_LIST_BOTS, SEL.agentItem);
+  const bots = await cdp.call(PAGE_BOTS);
   if (!bots.length)
-    throw new Error("No Bots found in the sidebar. Is Grok Bot signed in and showing its main window?");
+    throw new Error("No Bots found. Is Grok Bot signed in and showing its main window?");
   return bots;
 }
 function matchBot(bots, query) {
   const q = query.trim().toLowerCase();
-  const exact = bots.filter((b) => b.id === query || b.name.toLowerCase() === q || b.label.toLowerCase() === q);
+  const exact = bots.filter((b) => b.id === query.trim() || b.name.toLowerCase() === q);
   if (exact.length === 1)
     return exact[0];
   const partial = bots.filter((b) => b.name.toLowerCase().startsWith(q));
@@ -232,104 +406,85 @@ function matchBot(bots, query) {
   const names = bots.map((b) => b.name).join(", ");
   throw new Error(exact.length + partial.length > 1 ? `"${query}" matches several Bots: ${names}` : `No Bot named "${query}". Bots: ${names}`);
 }
-async function openBot(cdp, query) {
-  const bot = matchBot(await listBots(cdp), query);
-  if (!bot.active) {
-    await cdp.call(`(sel, id) => document.querySelector(sel + '[data-agent-id="' + id + '"]').click()`, SEL.agentItem, bot.id);
-  }
-  let last = "";
-  let stable = 0;
-  for (let i = 0;i < 40 && stable < 3; i++) {
-    await sleep2(200);
-    const snap = await cdp.call(`(sel, rowSel, prompt, id) => { const a = document.querySelector(sel + '[data-active="true"]');
-        return (a && a.dataset.agentId === id && document.querySelector(prompt)) ? "open:" + [...document.querySelectorAll(rowSel)].map(r => r.dataset.rowKey).join("|") : "" }`, SEL.agentItem, SEL.row, SEL.prompt, bot.id);
-    stable = snap && snap === last ? stable + 1 : 0;
-    last = snap;
-  }
-  if (!last)
-    throw new Error(`Couldn't open ${bot.name}'s conversation.`);
-  return { ...bot, active: true };
+async function findBot(cdp, query) {
+  return matchBot(await listBots(cdp), query);
 }
-async function readVisible(cdp) {
-  return cdp.call(PAGE_ROWS, SEL.row);
+async function read(cdp, botQuery, opts = {}) {
+  const bot = await findBot(cdp, botQuery);
+  const limit = opts.limit ?? (opts.since ? 0 : 10);
+  const messages = await cdp.call(PAGE_READ, bot.id, limit, opts.since ?? null);
+  return { bot: bot.name, messages };
 }
-async function read(cdp, botQuery, limit = 10) {
-  const bot = await openBot(cdp, botQuery);
-  await cdp.call(`() => { const log = document.querySelector('[role="log"]'); if (log) log.scrollTop = log.scrollHeight; }`);
-  await sleep2(300);
-  const msgs = await readVisible(cdp);
-  return { bot: bot.name, messages: msgs.slice(-limit) };
+var MAX_FILE_BYTES = 25 * 1024 * 1024;
+var TYPES = {
+  txt: "text/plain",
+  md: "text/markdown",
+  csv: "text/csv",
+  json: "application/json",
+  pdf: "application/pdf",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  html: "text/html"
+};
+async function loadFiles(paths) {
+  return Promise.all(paths.map(async (p) => {
+    const info = await stat(p).catch(() => null);
+    if (!info?.isFile())
+      throw new Error(`Not a file: ${p}`);
+    if (info.size > MAX_FILE_BYTES)
+      throw new Error(`${p} is over 25 MB.`);
+    const name = basename(p);
+    const type = TYPES[name.split(".").pop()?.toLowerCase() ?? ""] ?? "application/octet-stream";
+    return { name, type, data: (await readFile(p)).toString("base64") };
+  }));
 }
-async function sendToOpen(cdp, text) {
-  const before = new Set((await readVisible(cdp)).map((m) => m.key));
-  const focused = await cdp.call(`(sel) => { const f = document.querySelector(sel); if (!f) return false; f.focus(); return true; }`, SEL.prompt);
-  if (!focused)
-    throw new Error("Message box not found.");
-  const existing = await cdp.call(`(sel) => document.querySelector(sel).innerText.trim()`, SEL.prompt);
-  if (existing)
-    throw new Error("The message box already has a draft in it. Send or clear it in Grok Bot first.");
-  const lines = text.replace(/\r\n/g, `
-`).split(`
-`);
-  for (let i = 0;i < lines.length; i++) {
-    if (lines[i])
-      await cdp.send("Input.insertText", { text: lines[i] });
-    if (i < lines.length - 1)
-      await cdp.pressKey("Enter", true);
-  }
-  await sleep2(150);
-  await cdp.pressKey("Enter");
-  for (let i = 0;i < 50; i++) {
-    await sleep2(200);
-    const sent = (await readVisible(cdp)).find((m) => m.role === "user" && !before.has(m.key));
-    if (sent)
-      return sent.key;
-  }
-  throw new Error("The message didn't appear in the conversation after sending.");
-}
-async function send(cdp, botQuery, text) {
-  if (!text.trim())
+async function send(cdp, botQuery, text, files = []) {
+  if (!text.trim() && !files.length)
     throw new Error("Message is empty.");
-  const bot = await openBot(cdp, botQuery);
-  return { bot: bot.name, key: await sendToOpen(cdp, text) };
+  const bot = await findBot(cdp, botQuery);
+  const key = await cdp.call(PAGE_SEND, bot.id, text.trim(), await loadFiles(files));
+  return { bot: bot.name, key };
+}
+async function withHeartbeat(cdp, fn) {
+  const beat = `beat_${process.pid}_${Date.now()}`;
+  const name = JSON.stringify(beat);
+  const touch = () => cdp.eval(`{ const g = (window.__grokbot = window.__grokbot || {}); g[${name}] = Date.now(); g.ticks?.[${name}]?.(); }`).catch(() => {});
+  await touch();
+  const iv = setInterval(touch, 1000);
+  try {
+    return await fn(beat);
+  } finally {
+    clearInterval(iv);
+  }
+}
+async function wait(cdp, botQuery, opts = {}) {
+  const bot = await findBot(cdp, botQuery);
+  const sink = opts.onUpdate ? await cdp.bind((p) => opts.onUpdate?.(JSON.parse(p))) : null;
+  const r = await withHeartbeat(cdp, (beat) => cdp.call(PAGE_WAIT, bot.id, opts.since ?? null, opts.timeoutMs ?? 1800000, opts.settleMs ?? 8000, beat, sink));
+  return { bot: bot.name, ...r };
 }
 async function ask(cdp, botQuery, text, opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? 300000;
-  const settleMs = opts.settleMs ?? 8000;
   const t0 = Date.now();
-  const target = await openBot(cdp, botQuery);
-  const sentKey = await sendToOpen(cdp, text);
-  const bot = target.name;
-  const replies = new Map;
-  let idleSince = null;
-  while (Date.now() - t0 < timeoutMs) {
-    await sleep2(700);
-    const activeId = await cdp.call(`(sel) => document.querySelector(sel + '[data-active="true"]')?.dataset.agentId ?? null`, SEL.agentItem);
-    if (activeId !== target.id) {
-      return { bot, status: "interrupted", messages: [...replies.values()], elapsedMs: Date.now() - t0 };
-    }
-    const rows = await readVisible(cdp);
-    const idx = rows.findIndex((m) => m.key === sentKey);
-    const after = idx >= 0 ? rows.slice(idx + 1) : rows;
-    for (const m of after) {
-      if (m.role === "user")
-        continue;
-      const prev = replies.get(m.key);
-      if (!prev || prev.text !== m.text) {
-        replies.set(m.key, m);
-        opts.onUpdate?.(m);
-      }
-    }
-    const busy = await cdp.call(`(sel) => !!document.querySelector(sel)`, SEL.busy);
-    if (busy || replies.size === 0)
-      idleSince = null;
-    else
-      idleSince ??= Date.now();
-    if (idleSince !== null && Date.now() - idleSince >= settleMs) {
-      return { bot, status: "done", messages: [...replies.values()], elapsedMs: Date.now() - t0 };
-    }
-  }
-  return { bot, status: "timeout", messages: [...replies.values()], elapsedMs: Date.now() - t0 };
+  const sent = await send(cdp, botQuery, text, opts.files);
+  const r = await wait(cdp, sent.bot, {
+    ...opts,
+    since: sent.key,
+    timeoutMs: Math.max(1000, (opts.timeoutMs ?? 300000) - (Date.now() - t0))
+  });
+  return { ...r, key: sent.key, elapsedMs: Date.now() - t0 };
+}
+async function watch(cdp, botQuery, onEvent, settleMs = 8000) {
+  const only = botQuery ? (await findBot(cdp, botQuery)).id : null;
+  await cdp.send("Runtime.enable");
+  const sink = await cdp.bind((p) => onEvent(JSON.parse(p)));
+  await withHeartbeat(cdp, (beat) => cdp.call(PAGE_WATCH, only, settleMs, beat, sink));
+}
+async function stop(cdp, botQuery) {
+  const bot = await findBot(cdp, botQuery);
+  return { bot: bot.name, stopped: await cdp.call(PAGE_STOP, bot.id) };
 }
 async function usage(cdp) {
   const get = () => cdp.call(`async () => { const m = window.desktop?.main; return m?.getCursorUsageSummary ? await m.getCursorUsageSummary() : null; }`);
@@ -351,8 +506,7 @@ async function usage(cdp) {
 }
 async function status(cdp) {
   const bots = await listBots(cdp);
-  const busy = await cdp.call(`(sel) => !!document.querySelector(sel)`, SEL.busy);
-  return { bots, busy, usage: await usage(cdp).catch(() => null) };
+  return { bots, busy: bots.some((b) => b.running), usage: await usage(cdp).catch(() => null) };
 }
 
 // src/mcp.ts
@@ -360,22 +514,12 @@ import { createInterface } from "node:readline";
 
 // src/roster.ts
 var sleep3 = (ms) => new Promise((r) => setTimeout(r, ms));
-var ROSTER = `(() => {
-  const start = document.querySelector(".sand-agent-item[data-agent-id]") || document.querySelector("button");
-  const key = start && Object.keys(start).find((k) => k.startsWith("__reactFiber"));
-  for (let f = key ? start[key] : null; f; f = f.return) {
-    const r = f.memoizedProps && f.memoizedProps.value && f.memoizedProps.value.roster;
-    if (r && typeof r.createAgent === "function" && typeof r.snapshots?.get === "function") return r;
-  }
-  return null;
-})()`;
 var NO_ROSTER = "Couldn't reach Grok Bot's Bot list. This app version may not support managing Bots.";
 var PAGE_OP = `async (op, arg) => {
-  const roster = ${ROSTER};
+  const roster = ${store("roster", "createAgent")};
   if (!roster) return { error: ${JSON.stringify(NO_ROSTER)} };
-  const rows = () => roster.snapshots.get().agents.rows.filter((r) => !r.isGroup);
   const profile = (r) => ({ id: r.id, name: r.name, description: r.description || "", hidden: !!r.isHiddenFromSidebar, running: !!r.isRunning });
-  const message = (e) => (e && e.failure && e.failure.code ? e.failure.code + (e.message && e.message !== e.failure.code ? ": " + e.message : "") : String((e && e.message) || e));
+  const message = ${PAGE_ERROR};
   const awake = async (id, fn) => {
     for (let i = 0; ; i++) {
       await Promise.resolve(window.desktop?.main?.signalBoxIntent?.({ agentId: id, intent: "composer_focus" })).catch(() => {});
@@ -386,7 +530,6 @@ var PAGE_OP = `async (op, arg) => {
     }
   };
   try {
-    if (op === "list") return { value: rows().map(profile) };
     if (op === "create") {
       const res = await roster.createAgent({ name: arg.name, description: arg.description, origin: "user", isKickstartRequested: false });
       return { value: profile(res.agent) };
@@ -414,20 +557,11 @@ async function op(cdp, name, arg) {
     throw new Error(r.error);
   return r.value;
 }
-function listProfiles(cdp) {
-  return op(cdp, "list");
-}
-async function findProfile(cdp, query) {
-  const profiles = await listProfiles(cdp);
-  const bots = profiles.map((p) => ({ id: p.id, name: p.name, label: p.name, active: false, preview: null }));
-  const bot = matchBot(bots, query);
-  return profiles.find((p) => p.id === bot.id);
-}
 async function createBot(cdp, input) {
   const name = input.name.trim();
   if (!name)
     throw new Error("A Bot needs a name.");
-  const profiles = await listProfiles(cdp);
+  const profiles = await listBots(cdp).catch(() => []);
   if (profiles.some((p) => p.name.toLowerCase() === name.toLowerCase()))
     throw new Error(`You already have a Bot named "${name}".`);
   const bot = await op(cdp, "create", { name, description: input.description?.trim() ?? "" });
@@ -439,16 +573,17 @@ async function createBot(cdp, input) {
   return bot;
 }
 async function updateBot(cdp, query, changes) {
-  const current = await findProfile(cdp, query);
+  const current = matchBot(await listBots(cdp), query);
   const name = changes.name?.trim() || current.name;
   const description = changes.description?.trim() ?? current.description;
-  if (name === current.name && description === current.description)
-    return current;
+  if (name === current.name && description === current.description) {
+    return { id: current.id, name, description, hidden: current.hidden, running: current.running };
+  }
   return op(cdp, "update", { id: current.id, name, description });
 }
 async function deleteBot(cdp, query) {
   const q = query.trim().toLowerCase();
-  const matches = (await listProfiles(cdp)).filter((p) => p.id === query.trim() || p.name.toLowerCase() === q);
+  const matches = (await listBots(cdp)).filter((p) => p.id === query.trim() || p.name.toLowerCase() === q);
   if (matches.length !== 1) {
     throw new Error(matches.length ? `"${query}" matches several Bots. Use the Bot's id.` : `No Bot named exactly "${query}".`);
   }
@@ -464,17 +599,18 @@ var VERSION = "0.1.0";
 var TOOLS = [
   {
     name: "grokbot_list_bots",
-    description: "List the Grok Bots in the user's Grok Bot desktop app (name, role label, id, whether open).",
+    description: "List the Grok Bots in the user's Grok Bot desktop app: name, description, id, and whether each is working, needs the user's input, or has unread messages.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false }
   },
   {
     name: "grokbot_ask",
-    description: "Send a message to a Grok Bot and wait for its reply. Bots run on a cloud computer with a browser and can research the web and X, use connected apps, and do multi-step work. Returns the Bot's reply messages. If the Bot is still working at the timeout, returns what it has so far with status 'timeout'; call grokbot_read later for the rest.",
+    description: "Send a message to a Grok Bot and wait for its reply. Bots run on a cloud computer with a browser and can research the web and X, use connected apps, and do multi-step work. Returns the Bot's reply messages and the sent message's key. Status 'timeout' means it's still working: call grokbot_wait with since=key. Status 'needs_input' means the Bot is waiting on the user in the app.",
     inputSchema: {
       type: "object",
       properties: {
         bot: { type: "string", description: "Bot name (e.g. 'Chief') or id" },
         message: { type: "string", description: "The message to send, written like a request to a teammate" },
+        files: { type: "array", items: { type: "string" }, description: "Optional absolute paths of local files to attach (25 MB each)" },
         timeout_seconds: { type: "number", description: "Max seconds to wait for replies (default 300, max 1800)" },
         settle_seconds: { type: "number", description: "Idle seconds before the reply counts as finished (default 8)" }
       },
@@ -484,13 +620,37 @@ var TOOLS = [
   },
   {
     name: "grokbot_send",
-    description: "Send a message to a Grok Bot without waiting for a reply. Use grokbot_read later to collect it.",
+    description: "Send a message to a Grok Bot without waiting. Returns the message key; pass it to grokbot_wait or grokbot_read as 'since' to collect the reply.",
     inputSchema: {
       type: "object",
-      properties: { bot: { type: "string" }, message: { type: "string" } },
+      properties: {
+        bot: { type: "string" },
+        message: { type: "string" },
+        files: { type: "array", items: { type: "string" }, description: "Optional absolute paths of local files to attach" }
+      },
       required: ["bot", "message"],
       additionalProperties: false
     }
+  },
+  {
+    name: "grokbot_wait",
+    description: "Wait for a Grok Bot to finish replying (to the message at 'since', or the user's latest message) and return its replies. Event-driven, no polling. Returns status 'done', 'timeout' (still working) or 'needs_input' (waiting on the user in the app).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        bot: { type: "string" },
+        since: { type: "string", description: "Message key from grokbot_send or grokbot_ask" },
+        timeout_seconds: { type: "number", description: "Max seconds to wait (default 600, max 3600)" },
+        settle_seconds: { type: "number", description: "Idle seconds before the reply counts as finished (default 8)" }
+      },
+      required: ["bot"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "grokbot_stop",
+    description: "Interrupt what a Grok Bot is doing, like the app's Stop button. Use when the user asks, or a task is clearly running away.",
+    inputSchema: { type: "object", properties: { bot: { type: "string" } }, required: ["bot"], additionalProperties: false }
   },
   {
     name: "grokbot_create_bot",
@@ -539,23 +699,25 @@ var TOOLS = [
   },
   {
     name: "grokbot_read",
-    description: "Read the most recent messages in a Grok Bot conversation.",
+    description: "Read messages in a Grok Bot conversation without switching the app's view: the most recent ones, or everything after a message key.",
     inputSchema: {
       type: "object",
-      properties: { bot: { type: "string" }, limit: { type: "number", description: "Max messages (default 10)" } },
+      properties: {
+        bot: { type: "string" },
+        limit: { type: "number", description: "Max messages (default 10)" },
+        since: { type: "string", description: "Only messages after this key" }
+      },
       required: ["bot"],
       additionalProperties: false
     }
   }
 ];
-var queue = Promise.resolve();
-function serialized(fn) {
-  const next = queue.then(fn, fn);
-  queue = next.catch(() => {});
-  return next;
-}
+var launching = null;
 async function withApp(fn) {
-  await launch();
+  launching ??= launch().finally(() => {
+    launching = null;
+  });
+  await launching;
   const cdp = await CDP.connect();
   try {
     return await fn(cdp);
@@ -571,16 +733,27 @@ async function callTool(name, args) {
     return v;
   };
   const opt = (k) => typeof args[k] === "string" ? args[k] : undefined;
+  const files = Array.isArray(args.files) ? args.files.map(String) : [];
+  const seconds = (k, def, min, max) => Math.min(Math.max(Number(args[k] ?? def) || def, min), max) * 1000;
   switch (name) {
     case "grokbot_list_bots":
       return withApp((c) => listBots(c));
-    case "grokbot_ask": {
-      const t = Math.min(Math.max(Number(args.timeout_seconds ?? 300), 10), 1800);
-      const settle = Math.min(Math.max(Number(args.settle_seconds ?? 8), 2), 120);
-      return withApp((c) => ask(c, str("bot"), str("message"), { timeoutMs: t * 1000, settleMs: settle * 1000 }));
-    }
+    case "grokbot_ask":
+      return withApp((c) => ask(c, str("bot"), opt("message") ?? "", {
+        files,
+        timeoutMs: seconds("timeout_seconds", 300, 10, 1800),
+        settleMs: seconds("settle_seconds", 8, 2, 120)
+      }));
     case "grokbot_send":
-      return withApp((c) => send(c, str("bot"), str("message")));
+      return withApp((c) => send(c, str("bot"), opt("message") ?? "", files));
+    case "grokbot_wait":
+      return withApp((c) => wait(c, str("bot"), {
+        since: opt("since"),
+        timeoutMs: seconds("timeout_seconds", 600, 10, 3600),
+        settleMs: seconds("settle_seconds", 8, 2, 120)
+      }));
+    case "grokbot_stop":
+      return withApp((c) => stop(c, str("bot")));
     case "grokbot_create_bot":
       return withApp((c) => createBot(c, { name: str("name"), description: opt("description") }));
     case "grokbot_update_bot": {
@@ -597,7 +770,7 @@ async function callTool(name, args) {
     case "grokbot_usage":
       return withApp((c) => usage(c));
     case "grokbot_read":
-      return withApp((c) => read(c, str("bot"), Number(args.limit ?? 10)));
+      return withApp((c) => read(c, str("bot"), { limit: args.limit === undefined ? undefined : Number(args.limit) || 10, since: opt("since") }));
     default:
       throw new Error(`Unknown tool ${name}`);
   }
@@ -634,7 +807,7 @@ function serveMcp() {
           return reply({ tools: TOOLS });
         case "tools/call": {
           try {
-            const out = await serialized(() => callTool(params?.name ?? "", params?.arguments ?? {}));
+            const out = await callTool(params?.name ?? "", params?.arguments ?? {});
             return reply({ content: [{ type: "text", text: JSON.stringify(out, null, 2) }] });
           } catch (e) {
             return reply({ content: [{ type: "text", text: String(e.message ?? e) }], isError: true });
@@ -654,9 +827,12 @@ var USAGE = `grokbot ${VERSION} — talk to your Grok Bots from the terminal or 
 
 Usage:
   grokbot ask <bot> <message...>    Send a message and wait for the reply
-  grokbot send <bot> <message...>   Send without waiting
+  grokbot send <bot> <message...>   Send without waiting; prints the message key
+  grokbot wait <bot>                Wait for the Bot to finish replying to your latest message
   grokbot read <bot>                Show recent messages in a conversation
-  grokbot bots                      List your Bots
+  grokbot watch [bot]               Stream new replies and working/idle changes as JSON lines
+  grokbot stop <bot>                Interrupt what the Bot is doing (like the Stop button)
+  grokbot bots                      List your Bots and what each is doing
   grokbot create <name>             Create a Bot (--description <text>)
   grokbot update <bot>              Rename a Bot or change its description (--name, --description)
   grokbot delete <bot> --yes        Permanently delete a Bot (exact name or id)
@@ -667,27 +843,33 @@ Usage:
   grokbot mcp                       Run as an MCP server over stdio
 
 Options:
-  --timeout <sec>   ask: max seconds to wait (default 300)
-  --settle <sec>    ask: idle seconds before the reply counts as finished (default 8)
+  --file <path>     ask/send: attach a file (repeat for several, 25 MB each)
+  --timeout <sec>   ask/wait: max seconds to wait (ask 300, wait 1800)
+  --settle <sec>    ask/wait/watch: idle seconds before a reply counts as finished (default 8)
+  --since <key>     wait/read: messages after this message key (from send/ask/read --json)
   --limit <n>       read: number of messages (default 10)
   --name <text>     update: new name
   --description <t> create/update: what the Bot is for
   --yes             delete: confirm deleting the Bot
   --json            Machine-readable output
-  --quiet           ask: don't stream progress to stderr
+  --quiet           ask/wait: don't stream progress to stderr
   -v, --version     Print version
   -h, --help        Show this help
 
 Use "-" as the message to read it from stdin.
+Exit codes for ask/wait: 0 finished, 2 still working at the timeout, 3 the Bot needs your input in the app.
 Env: GROKBOT_CDP_PORT (default 9333), GROKBOT_APP (path to the app)`;
 function parse(argv) {
   const flags = {};
+  const files = [];
   const rest = [];
   for (let i = 0;i < argv.length; i++) {
     const a = argv[i];
     if (a === "--json" || a === "--quiet" || a === "--yes")
       flags[a.slice(2)] = true;
-    else if (["--timeout", "--limit", "--settle", "--name", "--description"].includes(a))
+    else if (a === "--file")
+      files.push(argv[++i] ?? "");
+    else if (["--timeout", "--limit", "--settle", "--since", "--name", "--description"].includes(a))
       flags[a.slice(2)] = argv[++i] ?? "";
     else if (a === "-h" || a === "--help")
       flags.help = true;
@@ -696,7 +878,7 @@ function parse(argv) {
     else
       rest.push(a);
   }
-  return { flags, cmd: rest[0], args: rest.slice(1) };
+  return { flags, files, cmd: rest[0], args: rest.slice(1) };
 }
 async function readMessage(parts) {
   if (parts.length === 1 && parts[0] === "-") {
@@ -732,6 +914,24 @@ function formatUsage(u) {
   }
   return parts.join(" · ");
 }
+var progress = (m) => console.error(`[grokbot] ${m.role === "card" ? "card" : "reply"}: ${m.text.slice(0, 100).replace(/\s+/g, " ")}`);
+function printReplies(r, json, extra = {}) {
+  if (json)
+    console.log(JSON.stringify({ ...r, ...extra }, null, 2));
+  else {
+    const body = r.messages.map((m) => m.role === "card" ? `[card] ${m.text}` : m.text).join(`
+
+`);
+    const tail = r.status === "timeout" ? `
+
+[grokbot] ${r.bot} hasn't finished after ${Math.round(r.elapsedMs / 1000)}s. Run \`grokbot wait ${r.bot}\` to keep waiting.` : r.status === "needs_input" ? `
+
+[grokbot] ${r.bot} is waiting for you in the Grok Bot app (an approval or question). Answer it there.` : "";
+    console.log((body || (r.status === "done" ? "(The Bot finished without replying.)" : "(no reply yet)")) + tail);
+  }
+  if (r.status !== "done")
+    process.exitCode = r.status === "needs_input" ? 3 : 2;
+}
 async function withApp2(fn) {
   const { restarted } = await launch();
   if (restarted)
@@ -744,7 +944,7 @@ async function withApp2(fn) {
   }
 }
 async function main() {
-  const { flags, cmd, args } = parse(process.argv.slice(2));
+  const { flags, files, cmd, args } = parse(process.argv.slice(2));
   if (flags.version)
     return console.log(VERSION);
   if (flags.help || !cmd)
@@ -775,7 +975,14 @@ ${formatUsage(s.usage)}` : ""}`);
     }
     case "bots": {
       const bots = await withApp2(listBots);
-      return out(bots, () => bots.map((b) => `${b.active ? "*" : " "} ${b.label}  (${b.id})`).join(`
+      return out(bots, () => bots.map((b) => {
+        const state = [
+          b.needsInput ? "needs your input" : b.running ? "working" : "idle",
+          b.unread ? `${b.unread} unread` : "",
+          b.hidden ? "hidden" : ""
+        ];
+        return `${b.name}${b.description ? ` — ${b.description}` : ""}  (${b.id})  [${state.filter(Boolean).join(", ")}]`;
+      }).join(`
 `));
     }
     case "usage": {
@@ -809,10 +1016,12 @@ ${formatUsage(s.usage)}` : ""}`);
       return out(b, () => `Deleted ${b.name}.`);
     }
     case "read": {
-      const [bot] = args;
+      const bot = args.join(" ").trim();
       if (!bot)
-        throw new Error("Usage: grokbot read <bot>");
-      const r = await withApp2((c) => read(c, bot, positiveNumber(flags.limit, "limit", 10)));
+        throw new Error("Usage: grokbot read <bot> [--limit <n>] [--since <key>]");
+      const since = str(flags.since);
+      const limit = flags.limit === undefined ? undefined : positiveNumber(flags.limit, "limit", 10);
+      const r = await withApp2((c) => read(c, bot, { limit, since }));
       return out(r, () => r.messages.map((m) => `[${m.role === "user" ? "you" : m.role === "card" ? "card" : r.bot}] ${m.text}`).join(`
 
 `));
@@ -820,34 +1029,51 @@ ${formatUsage(s.usage)}` : ""}`);
     case "send": {
       const [bot, ...rest] = args;
       const msg = await readMessage(rest);
-      if (!bot || !msg)
-        throw new Error("Usage: grokbot send <bot> <message...>");
-      const r = await withApp2((c) => send(c, bot, msg));
-      return out(r, () => `Sent to ${r.bot}.`);
+      if (!bot || !msg && !files.length)
+        throw new Error("Usage: grokbot send <bot> <message...> [--file <path>]");
+      const r = await withApp2((c) => send(c, bot, msg, files));
+      return out(r, () => `Sent to ${r.bot} (key ${r.key}). Run \`grokbot wait ${r.bot}\` for the reply.`);
+    }
+    case "wait": {
+      const bot = args.join(" ").trim();
+      if (!bot)
+        throw new Error("Usage: grokbot wait <bot> [--since <key>] [--timeout <sec>]");
+      const r = await withApp2((c) => wait(c, bot, {
+        since: str(flags.since),
+        timeoutMs: positiveNumber(flags.timeout, "timeout", 1800) * 1000,
+        settleMs: positiveNumber(flags.settle, "settle", 8) * 1000,
+        onUpdate: flags.quiet ? undefined : progress
+      }));
+      return printReplies(r, !!flags.json);
+    }
+    case "watch": {
+      const bot = args.join(" ").trim() || null;
+      const line = (e) => console.log(flags.json || e.type !== "message" ? JSON.stringify(e) : `[${e.bot}] ${e.role === "card" ? "[card] " : ""}${e.text}`);
+      await withApp2((c) => {
+        console.error(`[grokbot] Watching ${bot ?? "all Bots"}. Press Ctrl-C to stop.`);
+        return watch(c, bot, line, positiveNumber(flags.settle, "settle", 8) * 1000);
+      });
+      return;
+    }
+    case "stop": {
+      const bot = args.join(" ").trim();
+      if (!bot)
+        throw new Error("Usage: grokbot stop <bot>");
+      const r = await withApp2((c) => stop(c, bot));
+      return out(r, () => r.stopped ? `Stopped ${r.bot}.` : `${r.bot} wasn't working.`);
     }
     case "ask": {
       const [bot, ...rest] = args;
       const msg = await readMessage(rest);
-      if (!bot || !msg)
-        throw new Error("Usage: grokbot ask <bot> <message...>");
-      const timeoutMs = positiveNumber(flags.timeout, "timeout", 300) * 1000;
+      if (!bot || !msg && !files.length)
+        throw new Error("Usage: grokbot ask <bot> <message...> [--file <path>]");
       const r = await withApp2((c) => ask(c, bot, msg, {
-        timeoutMs,
+        files,
+        timeoutMs: positiveNumber(flags.timeout, "timeout", 300) * 1000,
         settleMs: positiveNumber(flags.settle, "settle", 8) * 1000,
-        onUpdate: flags.quiet ? undefined : (m) => console.error(`[grokbot] ${m.role === "card" ? "card" : "reply"}: ${m.text.slice(0, 100).replace(/\s+/g, " ")}`)
+        onUpdate: flags.quiet ? undefined : progress
       }));
-      out(r, () => {
-        const body = r.messages.map((m) => m.role === "card" ? `[card] ${m.text}` : m.text).join(`
-
-`);
-        const tail = r.status === "done" ? "" : `
-
-[grokbot] ${r.status === "timeout" ? `Still working after ${Math.round(r.elapsedMs / 1000)}s. Run \`grokbot read ${r.bot}\` later.` : "The conversation was switched in the app before the reply finished."}`;
-        return (body || "(no reply yet)") + tail;
-      });
-      if (r.status !== "done")
-        process.exitCode = 2;
-      return;
+      return printReplies(r, !!flags.json);
     }
     default:
       throw new Error(`Unknown command "${cmd}".
