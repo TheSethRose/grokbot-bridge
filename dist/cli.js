@@ -2,12 +2,16 @@
 
 // src/app.ts
 import { execFile, spawn } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { existsSync as existsSync2, readdirSync } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { join as join2 } from "node:path";
 import { promisify } from "node:util";
 
 // src/cdp.ts
+import { existsSync } from "node:fs";
+import { createConnection } from "node:net";
+import { homedir } from "node:os";
+import { join } from "node:path";
 var DEFAULT_PORT = 9333;
 function cdpPort() {
   const n = Number(process.env.GROKBOT_CDP_PORT || DEFAULT_PORT);
@@ -23,6 +27,55 @@ async function listTargets(port = cdpPort()) {
     return null;
   }
 }
+function serviceSocketPath() {
+  if (process.env.GROKBOT_SOCKET)
+    return process.env.GROKBOT_SOCKET;
+  const runtime = process.env.XDG_RUNTIME_DIR;
+  return runtime ? join(runtime, "grokbot", "cdp.sock") : join(homedir(), ".grokbot", "cdp.sock");
+}
+function socketTransport(path) {
+  return new Promise((resolve, reject) => {
+    const sock = createConnection(path);
+    let buf = "";
+    const listeners = [];
+    sock.on("data", (d) => {
+      buf += d.toString("utf8");
+      for (let i = buf.indexOf("\x00");i >= 0; i = buf.indexOf("\x00")) {
+        const text = buf.slice(0, i);
+        buf = buf.slice(i + 1);
+        for (const l of listeners)
+          l(text);
+      }
+    });
+    sock.once("error", reject);
+    sock.once("connect", () => resolve({
+      send: (text) => sock.write(`${text}\x00`),
+      close: () => sock.end(),
+      onMessage: (cb) => listeners.push(cb),
+      onClose: (cb) => sock.on("close", cb)
+    }));
+  });
+}
+function wsTransport(ws) {
+  return {
+    send: (text) => ws.send(text),
+    close: () => ws.close(),
+    onMessage: (cb) => ws.addEventListener("message", (ev) => cb(String(ev.data))),
+    onClose: (cb) => ws.addEventListener("close", cb)
+  };
+}
+async function serviceAvailable() {
+  const path = serviceSocketPath();
+  if (!existsSync(path))
+    return false;
+  try {
+    (await socketTransport(path)).close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+var isMainWindow = (t) => t.type === "page" && /app\.asar|\/renderer\/index\.html/.test(t.url);
 
 class NotConnectedError extends Error {
   constructor(port) {
@@ -32,14 +85,15 @@ class NotConnectedError extends Error {
 }
 
 class CDP {
-  ws;
+  io;
+  sessionId;
   nextId = 0;
   pending = new Map;
   bindings = new Map;
-  constructor(ws) {
-    this.ws = ws;
-    ws.addEventListener("message", (ev) => {
-      const msg = JSON.parse(String(ev.data));
+  constructor(io) {
+    this.io = io;
+    io.onMessage((text) => {
+      const msg = JSON.parse(text);
       if (msg.method === "Runtime.bindingCalled")
         return this.bindings.get(msg.params.name)?.(msg.params.payload);
       const p = msg.id ? this.pending.get(msg.id) : undefined;
@@ -51,17 +105,19 @@ class CDP {
       else
         p.resolve(msg.result);
     });
-    ws.addEventListener("close", () => {
+    io.onClose(() => {
       for (const p of this.pending.values())
         p.reject(new Error("CDP connection closed"));
       this.pending.clear();
     });
   }
   static async connect(port = cdpPort()) {
+    if (await serviceAvailable())
+      return CDP.connectService();
     const targets = await listTargets(port);
     if (!targets)
       throw new NotConnectedError(port);
-    const page = targets.find((t) => t.type === "page" && /app\.asar|\/renderer\/index\.html/.test(t.url));
+    const page = targets.find(isMainWindow);
     if (!page)
       throw new Error(`Debug port ${port} is open, but no Grok Bot window was found on it.`);
     const ws = new WebSocket(page.webSocketDebuggerUrl);
@@ -69,11 +125,26 @@ class CDP {
       ws.addEventListener("open", () => resolve(), { once: true });
       ws.addEventListener("error", () => reject(new Error("Could not open the CDP websocket")), { once: true });
     });
-    return new CDP(ws);
+    return new CDP(wsTransport(ws));
+  }
+  static async connectService() {
+    const cdp = new CDP(await socketTransport(serviceSocketPath()));
+    try {
+      const { targetInfos } = await cdp.send("Target.getTargets");
+      const page = targetInfos.find(isMainWindow);
+      if (!page)
+        throw new Error("The grokbot service is running, but no Grok Bot window was found.");
+      const { sessionId } = await cdp.send("Target.attachToTarget", { targetId: page.targetId, flatten: true });
+      cdp.sessionId = sessionId;
+      return cdp;
+    } catch (e) {
+      cdp.close();
+      throw e;
+    }
   }
   send(method, params = {}) {
     const id = ++this.nextId;
-    this.ws.send(JSON.stringify({ id, method, params }));
+    this.io.send(JSON.stringify({ id, method, params, ...this.sessionId ? { sessionId: this.sessionId } : {} }));
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
     });
@@ -94,7 +165,7 @@ class CDP {
     return name;
   }
   close() {
-    this.ws.close();
+    this.io.close();
   }
 }
 
@@ -146,22 +217,22 @@ function appCandidates() {
     return [process.env.GROKBOT_APP];
   switch (process.platform) {
     case "darwin":
-      return ["/Applications/Grok Bot.app", join(homedir(), "Applications/Grok Bot.app")];
+      return ["/Applications/Grok Bot.app", join2(homedir2(), "Applications/Grok Bot.app")];
     case "win32": {
-      const local = process.env.LOCALAPPDATA ?? join(homedir(), "AppData/Local");
-      return [join(local, "Programs/Grok Bot/Grok Bot.exe"), join(process.env.ProgramFiles ?? "C:/Program Files", "Grok Bot/Grok Bot.exe")];
+      const local = process.env.LOCALAPPDATA ?? join2(homedir2(), "AppData/Local");
+      return [join2(local, "Programs/Grok Bot/Grok Bot.exe"), join2(process.env.ProgramFiles ?? "C:/Program Files", "Grok Bot/Grok Bot.exe")];
     }
     default:
-      return linuxAppCandidates(homedir());
+      return linuxAppCandidates(homedir2());
   }
 }
 var APPIMAGE_DIRS = ["Applications", "AppImages", ".local/bin", "Downloads"];
 var APPIMAGE_NAME = /^grok[-_ ]?bot.*\.appimage$/i;
 function linuxAppCandidates(home) {
   const appImages = APPIMAGE_DIRS.flatMap((dir) => {
-    const full = join(home, dir);
+    const full = join2(home, dir);
     try {
-      return readdirSync(full).filter((name) => APPIMAGE_NAME.test(name)).map((name) => join(full, name));
+      return readdirSync(full).filter((name) => APPIMAGE_NAME.test(name)).map((name) => join2(full, name));
     } catch {
       return [];
     }
@@ -174,7 +245,7 @@ function processMatchArgs(platform) {
   return ["-x", "grok-bot"];
 }
 function findApp() {
-  const found = appCandidates().find((p) => existsSync(p));
+  const found = appCandidates().find((p) => existsSync2(p));
   if (!found)
     throw new Error(`Grok Bot app not found. Looked in:
   ${appCandidates().join(`
@@ -225,6 +296,8 @@ function start(app, args) {
 }
 async function launch() {
   const port = cdpPort();
+  if (await serviceAvailable())
+    return { port, restarted: false, service: true };
   if (await listTargets(port))
     return { port, restarted: false };
   const app = findApp();
@@ -250,6 +323,8 @@ async function waitForMainWindow(port) {
   }
 }
 async function restore() {
+  if (await serviceAvailable())
+    throw new Error("Grok Bot runs under the grokbot service, which uses no debug port, so there's nothing to close.");
   const app = findApp();
   await quit();
   start(app, []);
@@ -257,7 +332,7 @@ async function restore() {
 
 // src/bot.ts
 import { mkdir, open as openFile, readFile, stat } from "node:fs/promises";
-import { basename, extname, join as join2, resolve } from "node:path";
+import { basename, extname, join as join3, resolve } from "node:path";
 var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
 var LIB = `
   const roster = ${store("roster", "createAgent")};
@@ -567,7 +642,7 @@ async function writeNew(dir, name, data) {
   const ext = extname(name);
   const stem = name.slice(0, name.length - ext.length) || "file";
   for (let n = 0;; n++) {
-    const target = join2(dir, n ? `${stem} (${n})${ext}` : name);
+    const target = join3(dir, n ? `${stem} (${n})${ext}` : name);
     const fh = await openFile(target, "wx").catch((e) => {
       if (e.code === "EEXIST")
         return null;
@@ -1137,6 +1212,146 @@ function serveMcp() {
   });
 }
 
+// src/service.ts
+import { execFile as execFile2, spawn as spawn2 } from "node:child_process";
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
+import { homedir as homedir3 } from "node:os";
+import { dirname, join as join4 } from "node:path";
+import { promisify as promisify2 } from "node:util";
+
+// src/pipe-mux.ts
+class PipeMux {
+  toBrowser;
+  nextClient = 0;
+  nextId = 0;
+  clients = new Map;
+  pending = new Map;
+  sessions = new Map;
+  constructor(toBrowser) {
+    this.toBrowser = toBrowser;
+  }
+  addClient(write) {
+    const id = ++this.nextClient;
+    this.clients.set(id, write);
+    return id;
+  }
+  fromClient(client, raw) {
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      this.clients.get(client)?.(JSON.stringify({ error: { message: `invalid CDP message: received ${JSON.stringify(raw.slice(0, 80))}, expected JSON` } }));
+      return;
+    }
+    if (typeof msg.id !== "number")
+      return;
+    const id = ++this.nextId;
+    this.pending.set(id, { client, id: msg.id, attach: msg.method === "Target.attachToTarget" });
+    this.toBrowser(JSON.stringify({ ...msg, id }));
+  }
+  fromBrowser(raw) {
+    const msg = JSON.parse(raw);
+    if (typeof msg.id === "number") {
+      const p = this.pending.get(msg.id);
+      if (!p)
+        return;
+      this.pending.delete(msg.id);
+      const sessionId = msg.result?.sessionId;
+      if (p.attach && sessionId)
+        this.sessions.set(sessionId, p.client);
+      this.clients.get(p.client)?.(JSON.stringify({ ...msg, id: p.id }));
+      return;
+    }
+    const owner = msg.sessionId ? this.sessions.get(msg.sessionId) : undefined;
+    if (owner !== undefined)
+      this.clients.get(owner)?.(raw);
+  }
+  removeClient(client) {
+    this.clients.delete(client);
+    for (const [id, p] of this.pending)
+      if (p.client === client)
+        this.pending.delete(id);
+    for (const [sessionId, owner] of this.sessions) {
+      if (owner !== client)
+        continue;
+      this.sessions.delete(sessionId);
+      this.toBrowser(JSON.stringify({ id: ++this.nextId, method: "Target.detachFromTarget", params: { sessionId } }));
+    }
+  }
+}
+
+// src/service.ts
+var run2 = promisify2(execFile2);
+var UNIT_NAME = "grokbot.service";
+function onFrames(stream, cb) {
+  let buf = "";
+  stream.on("data", (d) => {
+    buf += d.toString("utf8");
+    for (let i = buf.indexOf("\x00");i >= 0; i = buf.indexOf("\x00")) {
+      cb(buf.slice(0, i));
+      buf = buf.slice(i + 1);
+    }
+  });
+}
+async function runService() {
+  const path = serviceSocketPath();
+  if (await serviceAvailable())
+    throw new Error(`The grokbot service is already running (${path}).`);
+  if (await isRunning())
+    throw new Error("Grok Bot is already open without the service. Quit it, then start the service.");
+  mkdirSync(dirname(path), { recursive: true, mode: 448 });
+  chmodSync(dirname(path), 448);
+  rmSync(path, { force: true });
+  const app = spawn2(findApp(), ["--remote-debugging-pipe"], { stdio: ["ignore", "inherit", "inherit", "pipe", "pipe"] });
+  const toApp = app.stdio[3];
+  const mux = new PipeMux((text) => toApp.write(`${text}\x00`));
+  onFrames(app.stdio[4], (text) => mux.fromBrowser(text));
+  const server = createServer((sock) => {
+    const client = mux.addClient((text) => sock.write(`${text}\x00`));
+    onFrames(sock, (text) => mux.fromClient(client, text));
+    sock.on("close", () => mux.removeClient(client));
+    sock.on("error", () => sock.destroy());
+  });
+  await new Promise((resolve2) => server.listen(path, resolve2));
+  chmodSync(path, 384);
+  console.error(`[grokbot] Service ready on ${path}.`);
+  const stopApp = () => app.kill("SIGTERM");
+  process.once("SIGTERM", stopApp);
+  process.once("SIGINT", stopApp);
+  const code = await new Promise((resolve2) => app.once("exit", (c, signal) => resolve2(c ?? signal ?? "unknown")));
+  console.error(`[grokbot] Grok Bot exited (${code}); stopping the service.`);
+  server.close();
+  rmSync(path, { force: true });
+}
+async function openApp(args) {
+  if (await serviceAvailable()) {
+    spawn2(findApp(), args, { detached: true, stdio: "ignore" }).unref();
+    return;
+  }
+  await run2("systemctl", ["--user", "start", UNIT_NAME]);
+}
+function installService(cliPath) {
+  const unitPath = join4(process.env.XDG_CONFIG_HOME || join4(homedir3(), ".config"), "systemd", "user", UNIT_NAME);
+  const env = process.env.GROKBOT_APP ? `Environment=${JSON.stringify(`GROKBOT_APP=${process.env.GROKBOT_APP}`)}
+` : "";
+  mkdirSync(dirname(unitPath), { recursive: true });
+  writeFileSync(unitPath, `[Unit]
+Description=Grok Bot with a private debug pipe for grokbot-bridge
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+${env}ExecStart=${JSON.stringify(process.execPath)} ${JSON.stringify(cliPath)} service
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
+`);
+  return unitPath;
+}
+
 // src/cli.ts
 var USAGE = `grokbot ${VERSION} — talk to your Grok Bots from the terminal or any agent
 
@@ -1162,6 +1377,9 @@ Usage:
   grokbot launch                    (Re)start Grok Bot with the local debug port
   grokbot restore                   Restart Grok Bot normally (closes the port)
   grokbot mcp                       Run as an MCP server over stdio
+  grokbot service                   Run Grok Bot with a private debug pipe instead of a port (Linux, under systemd)
+  grokbot service install           Write the systemd --user unit for the service
+  grokbot open [url]                Open Grok Bot through the service (for the desktop launcher)
 
 Options:
   --file <path>     ask/send: attach a file (repeat for several, 25 MB each)
@@ -1298,21 +1516,32 @@ async function main() {
   switch (cmd) {
     case "mcp":
       return serveMcp();
+    case "service": {
+      if (args[0] !== "install")
+        return runService();
+      const unit = installService(process.argv[1]);
+      return out({ unit }, () => `Wrote ${unit}. Start it with:
+  systemctl --user daemon-reload && systemctl --user enable --now ${UNIT_NAME}`);
+    }
+    case "open":
+      return openApp(args);
     case "launch": {
       const r = await launch();
-      return out(r, () => r.restarted ? `Grok Bot restarted with debug port ${r.port} (127.0.0.1 only).` : `Already connected on port ${r.port}.`);
+      return out(r, () => r.service ? "Already connected through the grokbot service." : r.restarted ? `Grok Bot restarted with debug port ${r.port} (127.0.0.1 only).` : `Already connected on port ${r.port}.`);
     }
     case "restore":
       await restore();
       return out({ ok: true }, () => "Grok Bot restarted normally. The debug port is closed.");
     case "status": {
       const port = cdpPort();
-      if (!await listTargets(port))
+      const service = await serviceAvailable();
+      const via = service ? "through the grokbot service" : `on port ${port}`;
+      if (!service && !await listTargets(port))
         return out({ connected: false, port }, () => `Not connected (port ${port}). Run: grokbot launch`);
       const cdp = await CDP.connect();
       try {
         const s = await status(cdp);
-        return out({ connected: true, port, ...s }, () => `Connected on port ${port}. ${s.bots.length} Bot(s): ${s.bots.map((b) => b.name).join(", ")}${s.busy ? " · a Bot is working" : ""}${s.usage ? `
+        return out({ connected: true, port, service, ...s }, () => `Connected ${via}. ${s.bots.length} Bot(s): ${s.bots.map((b) => b.name).join(", ")}${s.busy ? " · a Bot is working" : ""}${s.usage ? `
 ${formatUsage(s.usage)}` : ""}`);
       } finally {
         cdp.close();

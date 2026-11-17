@@ -4,7 +4,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { CDP, cdpPort, listTargets } from "./cdp.ts";
+import { CDP, cdpPort, listTargets, serviceAvailable } from "./cdp.ts";
 import { APP_READY } from "./page.ts";
 
 const run = promisify(execFile);
@@ -101,11 +101,13 @@ function start(app: string, args: string[]): void {
   }
 }
 
-export type LaunchResult = { port: number; restarted: boolean };
+export type LaunchResult = { port: number; restarted: boolean; service?: boolean };
 
 /** Ensure Grok Bot is running with a loopback-only debug port. Restarts the app if needed. */
 export async function launch(): Promise<LaunchResult> {
   const port = cdpPort();
+  // Under `grokbot service` there's no port to open: the service already holds the app's debug pipe.
+  if (await serviceAvailable()) return { port, restarted: false, service: true };
   if (await listTargets(port)) return { port, restarted: false };
   const app = findApp();
   await quit();
@@ -135,6 +137,8 @@ async function waitForMainWindow(port: number): Promise<void> {
 
 /** Relaunch Grok Bot normally, closing the debug port. */
 export async function restore(): Promise<void> {
+  if (await serviceAvailable())
+    throw new Error("Grok Bot runs under the grokbot service, which uses no debug port, so there's nothing to close.");
   const app = findApp();
   await quit();
   start(app, []);
