@@ -103,15 +103,45 @@ function start(app: string, args: string[]): void {
 
 export type LaunchResult = { port: number; restarted: boolean; service?: boolean };
 
-/** Ensure Grok Bot is running with a loopback-only debug port. Restarts the app if needed. */
+export const SERVICE_UNIT = "grokbot.service";
+
+/** Where `grokbot service install` writes the systemd --user unit. */
+export function serviceUnitPath(): string {
+  return join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "systemd", "user", SERVICE_UNIT);
+}
+
+export type LaunchPlan = "use-service" | "start-service" | "use-port" | "restart-with-port";
+
+/**
+ * Once the service is installed it is the only way in: falling back to the port would open the
+ * very port the service avoids, and leave an app the service can't take over.
+ */
+export function launchPlan(s: { serviceUp: boolean; serviceInstalled: boolean; portOpen: boolean }): LaunchPlan {
+  if (s.serviceUp) return "use-service";
+  if (s.serviceInstalled) return "start-service";
+  return s.portOpen ? "use-port" : "restart-with-port";
+}
+
+/** Ensure Grok Bot is reachable: through `grokbot service` if installed, otherwise on a loopback-only debug port. */
 export async function launch(): Promise<LaunchResult> {
   const port = cdpPort();
-  // Under `grokbot service` there's no port to open: the service already holds the app's debug pipe.
-  if (await serviceAvailable()) return { port, restarted: false, service: true };
-  if (await listTargets(port)) return { port, restarted: false };
-  const app = findApp();
+  const plan = launchPlan({
+    serviceUp: await serviceAvailable(),
+    serviceInstalled: process.platform === "linux" && existsSync(serviceUnitPath()),
+    portOpen: (await listTargets(port)) !== null,
+  });
+  if (plan === "use-service") return { port, restarted: false, service: true };
+  if (plan === "use-port") return { port, restarted: false };
+  // Either way the app restarts: the service can only own a Grok Bot it starts itself.
   await quit();
-  start(app, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1"]);
+  if (plan === "start-service") {
+    await run("systemctl", ["--user", "start", SERVICE_UNIT]);
+    for (let i = 0; i < 120 && !(await serviceAvailable()); i++) await sleep(250);
+    if (!(await serviceAvailable())) throw new Error(`${SERVICE_UNIT} didn't come up. See: journalctl --user -u ${SERVICE_UNIT}`);
+    await waitForMainWindow(port);
+    return { port, restarted: true, service: true };
+  }
+  start(findApp(), [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1"]);
   for (let i = 0; i < 80; i++) {
     if (await listTargets(port)) {
       await waitForMainWindow(port);

@@ -4,16 +4,17 @@
 import { execFile, spawn } from "node:child_process";
 import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { promisify } from "node:util";
-import { findApp, isRunning } from "./app.ts";
+import { findApp, isRunning, SERVICE_UNIT, serviceUnitPath } from "./app.ts";
 import { serviceAvailable, serviceSocketPath } from "./cdp.ts";
 import { PipeMux } from "./pipe-mux.ts";
 
 const run = promisify(execFile);
-export const UNIT_NAME = "grokbot.service";
+export const UNIT_NAME = SERVICE_UNIT;
+/** Exit code for "another Grok Bot or service is already open": retrying can't fix it, so systemd mustn't. */
+export const SERVICE_CONFLICT_EXIT = 2;
 
 /** Splits a stream of NUL-terminated messages, the framing of both the CDP pipe and the socket. */
 function onFrames(stream: Readable, cb: (text: string) => void): void {
@@ -29,8 +30,16 @@ function onFrames(stream: Readable, cb: (text: string) => void): void {
 
 export async function runService(): Promise<void> {
   const path = serviceSocketPath();
-  if (await serviceAvailable()) throw new Error(`The grokbot service is already running (${path}).`);
-  if (await isRunning()) throw new Error("Grok Bot is already open without the service. Quit it, then start the service.");
+  const conflict = (await serviceAvailable())
+    ? `The grokbot service is already running (${path}).`
+    : (await isRunning())
+      ? "Grok Bot is already open without the service. Quit it, then start the service."
+      : null;
+  if (conflict) {
+    console.error(`grokbot: ${conflict}`);
+    process.exitCode = SERVICE_CONFLICT_EXIT;
+    return;
+  }
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   chmodSync(dirname(path), 0o700);
   rmSync(path, { force: true });
@@ -74,7 +83,7 @@ export async function openApp(args: string[]): Promise<void> {
 
 /** Write the systemd --user unit that keeps the service running for the graphical session. */
 export function installService(cliPath: string): string {
-  const unitPath = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "systemd", "user", UNIT_NAME);
+  const unitPath = serviceUnitPath();
   const env = process.env.GROKBOT_APP ? `Environment=${JSON.stringify(`GROKBOT_APP=${process.env.GROKBOT_APP}`)}\n` : "";
   mkdirSync(dirname(unitPath), { recursive: true });
   writeFileSync(
@@ -88,6 +97,7 @@ After=graphical-session.target
 ${env}ExecStart=${JSON.stringify(process.execPath)} ${JSON.stringify(cliPath)} service
 Restart=on-failure
 RestartSec=3
+RestartPreventExitStatus=${SERVICE_CONFLICT_EXIT}
 
 [Install]
 WantedBy=graphical-session.target

@@ -163,8 +163,11 @@ function printChange(r: RoutineChangeResult, done: string, json: boolean): void 
 }
 
 async function withApp<T>(fn: (cdp: CDP) => Promise<T>): Promise<T> {
-  const { restarted } = await launch();
-  if (restarted) console.error("[grokbot] Restarted Grok Bot with the local debug port.");
+  const { restarted, service } = await launch();
+  if (restarted)
+    console.error(
+      service ? "[grokbot] Started Grok Bot through the grokbot service." : "[grokbot] Restarted Grok Bot with the local debug port.",
+    );
   const cdp = await CDP.connect();
   try {
     return await fn(cdp);
@@ -196,7 +199,9 @@ async function main() {
       const r = await launch();
       return out(r, () =>
         r.service
-          ? "Already connected through the grokbot service."
+          ? r.restarted
+            ? "Started Grok Bot through the grokbot service."
+            : "Already connected through the grokbot service."
           : r.restarted
             ? `Grok Bot restarted with debug port ${r.port} (127.0.0.1 only).`
             : `Already connected on port ${r.port}.`,

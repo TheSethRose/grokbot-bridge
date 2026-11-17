@@ -294,15 +294,39 @@ function start(app, args) {
     spawn(app, args, { detached: true, stdio: "ignore" }).unref();
   }
 }
+var SERVICE_UNIT = "grokbot.service";
+function serviceUnitPath() {
+  return join2(process.env.XDG_CONFIG_HOME || join2(homedir2(), ".config"), "systemd", "user", SERVICE_UNIT);
+}
+function launchPlan(s) {
+  if (s.serviceUp)
+    return "use-service";
+  if (s.serviceInstalled)
+    return "start-service";
+  return s.portOpen ? "use-port" : "restart-with-port";
+}
 async function launch() {
   const port = cdpPort();
-  if (await serviceAvailable())
+  const plan = launchPlan({
+    serviceUp: await serviceAvailable(),
+    serviceInstalled: process.platform === "linux" && existsSync2(serviceUnitPath()),
+    portOpen: await listTargets(port) !== null
+  });
+  if (plan === "use-service")
     return { port, restarted: false, service: true };
-  if (await listTargets(port))
+  if (plan === "use-port")
     return { port, restarted: false };
-  const app = findApp();
   await quit();
-  start(app, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1"]);
+  if (plan === "start-service") {
+    await run("systemctl", ["--user", "start", SERVICE_UNIT]);
+    for (let i = 0;i < 120 && !await serviceAvailable(); i++)
+      await sleep(250);
+    if (!await serviceAvailable())
+      throw new Error(`${SERVICE_UNIT} didn't come up. See: journalctl --user -u ${SERVICE_UNIT}`);
+    await waitForMainWindow(port);
+    return { port, restarted: true, service: true };
+  }
+  start(findApp(), [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1"]);
   for (let i = 0;i < 80; i++) {
     if (await listTargets(port)) {
       await waitForMainWindow(port);
@@ -1216,8 +1240,7 @@ function serveMcp() {
 import { execFile as execFile2, spawn as spawn2 } from "node:child_process";
 import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { homedir as homedir3 } from "node:os";
-import { dirname, join as join4 } from "node:path";
+import { dirname } from "node:path";
 import { promisify as promisify2 } from "node:util";
 
 // src/pipe-mux.ts
@@ -1283,7 +1306,8 @@ class PipeMux {
 
 // src/service.ts
 var run2 = promisify2(execFile2);
-var UNIT_NAME = "grokbot.service";
+var UNIT_NAME = SERVICE_UNIT;
+var SERVICE_CONFLICT_EXIT = 2;
 function onFrames(stream, cb) {
   let buf = "";
   stream.on("data", (d) => {
@@ -1296,10 +1320,12 @@ function onFrames(stream, cb) {
 }
 async function runService() {
   const path = serviceSocketPath();
-  if (await serviceAvailable())
-    throw new Error(`The grokbot service is already running (${path}).`);
-  if (await isRunning())
-    throw new Error("Grok Bot is already open without the service. Quit it, then start the service.");
+  const conflict = await serviceAvailable() ? `The grokbot service is already running (${path}).` : await isRunning() ? "Grok Bot is already open without the service. Quit it, then start the service." : null;
+  if (conflict) {
+    console.error(`grokbot: ${conflict}`);
+    process.exitCode = SERVICE_CONFLICT_EXIT;
+    return;
+  }
   mkdirSync(dirname(path), { recursive: true, mode: 448 });
   chmodSync(dirname(path), 448);
   rmSync(path, { force: true });
@@ -1332,7 +1358,7 @@ async function openApp(args) {
   await run2("systemctl", ["--user", "start", UNIT_NAME]);
 }
 function installService(cliPath) {
-  const unitPath = join4(process.env.XDG_CONFIG_HOME || join4(homedir3(), ".config"), "systemd", "user", UNIT_NAME);
+  const unitPath = serviceUnitPath();
   const env = process.env.GROKBOT_APP ? `Environment=${JSON.stringify(`GROKBOT_APP=${process.env.GROKBOT_APP}`)}
 ` : "";
   mkdirSync(dirname(unitPath), { recursive: true });
@@ -1345,6 +1371,7 @@ After=graphical-session.target
 ${env}ExecStart=${JSON.stringify(process.execPath)} ${JSON.stringify(cliPath)} service
 Restart=on-failure
 RestartSec=3
+RestartPreventExitStatus=${SERVICE_CONFLICT_EXIT}
 
 [Install]
 WantedBy=graphical-session.target
@@ -1496,9 +1523,9 @@ function printChange(r, done, json) {
     process.exitCode = r.status === "needs_input" ? 3 : r.status === "timeout" ? 2 : 1;
 }
 async function withApp2(fn) {
-  const { restarted } = await launch();
+  const { restarted, service } = await launch();
   if (restarted)
-    console.error("[grokbot] Restarted Grok Bot with the local debug port.");
+    console.error(service ? "[grokbot] Started Grok Bot through the grokbot service." : "[grokbot] Restarted Grok Bot with the local debug port.");
   const cdp = await CDP.connect();
   try {
     return await fn(cdp);
@@ -1527,7 +1554,7 @@ async function main() {
       return openApp(args);
     case "launch": {
       const r = await launch();
-      return out(r, () => r.service ? "Already connected through the grokbot service." : r.restarted ? `Grok Bot restarted with debug port ${r.port} (127.0.0.1 only).` : `Already connected on port ${r.port}.`);
+      return out(r, () => r.service ? r.restarted ? "Started Grok Bot through the grokbot service." : "Already connected through the grokbot service." : r.restarted ? `Grok Bot restarted with debug port ${r.port} (127.0.0.1 only).` : `Already connected on port ${r.port}.`);
     }
     case "restore":
       await restore();
