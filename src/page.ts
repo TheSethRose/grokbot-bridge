@@ -17,6 +17,9 @@ function contextValue(test: string): string {
   })()`;
 }
 
+/** Page-side expression: true once the main window has rendered the Bot list, so the stores above can be found. */
+export const APP_READY = `document.querySelector(".sand-agent-item[data-agent-id]") !== null`;
+
 /** Page-side expression for the app store `name`, recognized by one of its methods. Null if not found. */
 export function store(name: string, method: string): string {
   const n = JSON.stringify(name);

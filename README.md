@@ -33,7 +33,7 @@ Your coding agent is good at code. Your Grok Bot is good at things that need a b
 
 - The [Grok Bot desktop app](https://x.ai/bot), signed in, with at least one Bot
 - Node.js 22 or newer (or Bun)
-- macOS. Windows and Linux paths are included but untested; see [Platform support](#platform-support).
+- macOS or Linux. Windows paths are included but untested; see [Platform support](#platform-support).
 
 ## Install
 
@@ -184,7 +184,7 @@ Messages go through the app's normal send path, so they show up in your conversa
 | --- | --- |
 | macOS | Tested with Grok Bot 0.71.2 |
 | Windows | Should work; untested. Set `GROKBOT_APP` if the app isn't in `%LOCALAPPDATA%\Programs\Grok Bot` |
-| Linux | Should work; untested. Set `GROKBOT_APP` to the binary path |
+| Linux | Tested with Grok Bot 1.0.1 (AppImage) on KDE Plasma, Wayland. Finds `/opt/Grok Bot/grok-bot`, `/usr/bin/grok-bot` and AppImages named like `grok-bot*.AppImage` or `grok_bot*.appimage` in `~/Applications`, `~/AppImages`, `~/.local/bin` and `~/Downloads`. Otherwise set `GROKBOT_APP` |
 
 Environment variables: `GROKBOT_CDP_PORT` (default `9333`) and `GROKBOT_APP` (path to the app).
 

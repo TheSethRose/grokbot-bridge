@@ -2,7 +2,7 @@
 
 // src/app.ts
 import { execFile, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -98,91 +98,6 @@ class CDP {
   }
 }
 
-// src/app.ts
-var run = promisify(execFile);
-var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-var PROCESS_NAME = "Grok Bot";
-function appCandidates() {
-  if (process.env.GROKBOT_APP)
-    return [process.env.GROKBOT_APP];
-  switch (process.platform) {
-    case "darwin":
-      return ["/Applications/Grok Bot.app", join(homedir(), "Applications/Grok Bot.app")];
-    case "win32": {
-      const local = process.env.LOCALAPPDATA ?? join(homedir(), "AppData/Local");
-      return [join(local, "Programs/Grok Bot/Grok Bot.exe"), join(process.env.ProgramFiles ?? "C:/Program Files", "Grok Bot/Grok Bot.exe")];
-    }
-    default:
-      return ["/opt/Grok Bot/grok-bot", "/usr/bin/grok-bot", "/usr/local/bin/grok-bot"];
-  }
-}
-function findApp() {
-  const found = appCandidates().find((p) => existsSync(p));
-  if (!found)
-    throw new Error(`Grok Bot app not found. Looked in:
-  ${appCandidates().join(`
-  `)}
-Set GROKBOT_APP to its path.`);
-  return found;
-}
-async function isRunning() {
-  try {
-    if (process.platform === "win32") {
-      const { stdout } = await run("tasklist", ["/FI", `IMAGENAME eq ${PROCESS_NAME}.exe`, "/NH"]);
-      return stdout.includes(PROCESS_NAME);
-    }
-    const pattern = process.platform === "darwin" ? "Grok Bot.app/Contents/MacOS/Grok Bot" : "grok-bot|Grok Bot";
-    await run("pgrep", ["-f", pattern]);
-    return true;
-  } catch {
-    return false;
-  }
-}
-async function quit() {
-  if (!await isRunning())
-    return;
-  if (process.platform === "darwin")
-    await run("osascript", ["-e", `tell application "${PROCESS_NAME}" to quit`]).catch(() => {});
-  else if (process.platform === "win32")
-    await run("taskkill", ["/IM", `${PROCESS_NAME}.exe`]).catch(() => {});
-  else
-    await run("pkill", ["-TERM", "-f", "grok-bot|Grok Bot"]).catch(() => {});
-  for (let i = 0;i < 40 && await isRunning(); i++)
-    await sleep(250);
-  if (await isRunning())
-    throw new Error("Grok Bot didn't quit. Quit it yourself, then rerun.");
-}
-function start(app, args) {
-  if (process.platform === "darwin") {
-    spawn("open", ["-a", app, ...args.length ? ["--args", ...args] : []], { detached: true, stdio: "ignore" }).unref();
-  } else {
-    spawn(app, args, { detached: true, stdio: "ignore" }).unref();
-  }
-}
-async function launch() {
-  const port = cdpPort();
-  if (await listTargets(port))
-    return { port, restarted: false };
-  const app = findApp();
-  await quit();
-  start(app, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1"]);
-  for (let i = 0;i < 80; i++) {
-    if (await listTargets(port))
-      return { port, restarted: true };
-    await sleep(250);
-  }
-  throw new Error(`Grok Bot started but debug port ${port} never opened.`);
-}
-async function restore() {
-  const app = findApp();
-  await quit();
-  start(app, []);
-}
-
-// src/bot.ts
-import { mkdir, open as openFile, readFile, stat } from "node:fs/promises";
-import { basename, extname, join as join2, resolve } from "node:path";
-
 // src/page.ts
 function contextValue(test) {
   return `(() => {
@@ -196,6 +111,7 @@ function contextValue(test) {
     return null;
   })()`;
 }
+var APP_READY = `document.querySelector(".sand-agent-item[data-agent-id]") !== null`;
 function store(name, method) {
   const n = JSON.stringify(name);
   return `(${contextValue(`v[${n}] && typeof v[${n}][${JSON.stringify(method)}] === "function"`)} || {})[${n}] || null`;
@@ -221,7 +137,127 @@ var PAGE_AWAKE = `async (id, fn) => {
   }
 }`;
 
+// src/app.ts
+var run = promisify(execFile);
+var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+var PROCESS_NAME = "Grok Bot";
+function appCandidates() {
+  if (process.env.GROKBOT_APP)
+    return [process.env.GROKBOT_APP];
+  switch (process.platform) {
+    case "darwin":
+      return ["/Applications/Grok Bot.app", join(homedir(), "Applications/Grok Bot.app")];
+    case "win32": {
+      const local = process.env.LOCALAPPDATA ?? join(homedir(), "AppData/Local");
+      return [join(local, "Programs/Grok Bot/Grok Bot.exe"), join(process.env.ProgramFiles ?? "C:/Program Files", "Grok Bot/Grok Bot.exe")];
+    }
+    default:
+      return linuxAppCandidates(homedir());
+  }
+}
+var APPIMAGE_DIRS = ["Applications", "AppImages", ".local/bin", "Downloads"];
+var APPIMAGE_NAME = /^grok[-_ ]?bot.*\.appimage$/i;
+function linuxAppCandidates(home) {
+  const appImages = APPIMAGE_DIRS.flatMap((dir) => {
+    const full = join(home, dir);
+    try {
+      return readdirSync(full).filter((name) => APPIMAGE_NAME.test(name)).map((name) => join(full, name));
+    } catch {
+      return [];
+    }
+  });
+  return ["/opt/Grok Bot/grok-bot", "/usr/bin/grok-bot", "/usr/local/bin/grok-bot", ...appImages];
+}
+function processMatchArgs(platform) {
+  if (platform === "darwin")
+    return ["-f", "Grok Bot.app/Contents/MacOS/Grok Bot"];
+  return ["-x", "grok-bot"];
+}
+function findApp() {
+  const found = appCandidates().find((p) => existsSync(p));
+  if (!found)
+    throw new Error(`Grok Bot app not found. Looked in:
+  ${appCandidates().join(`
+  `)}
+Set GROKBOT_APP to its path.`);
+  return found;
+}
+async function isRunning() {
+  try {
+    if (process.platform === "win32") {
+      const { stdout: stdout2 } = await run("tasklist", ["/FI", `IMAGENAME eq ${PROCESS_NAME}.exe`, "/NH"]);
+      return stdout2.includes(PROCESS_NAME);
+    }
+    if (process.platform === "darwin") {
+      await run("pgrep", processMatchArgs(process.platform));
+      return true;
+    }
+    const { stdout } = await run("ps", ["-C", "grok-bot", "-o", "stat="]);
+    return hasLiveProcess(stdout);
+  } catch {
+    return false;
+  }
+}
+function hasLiveProcess(psStat) {
+  return psStat.split(`
+`).some((line) => line.trim() !== "" && !line.trim().startsWith("Z"));
+}
+async function quit() {
+  if (!await isRunning())
+    return;
+  if (process.platform === "darwin")
+    await run("osascript", ["-e", `tell application "${PROCESS_NAME}" to quit`]).catch(() => {});
+  else if (process.platform === "win32")
+    await run("taskkill", ["/IM", `${PROCESS_NAME}.exe`]).catch(() => {});
+  else
+    await run("pkill", ["-TERM", ...processMatchArgs(process.platform)]).catch(() => {});
+  for (let i = 0;i < 120 && await isRunning(); i++)
+    await sleep(250);
+  if (await isRunning())
+    throw new Error("Grok Bot didn't quit. Quit it yourself, then rerun.");
+}
+function start(app, args) {
+  if (process.platform === "darwin") {
+    spawn("open", ["-a", app, ...args.length ? ["--args", ...args] : []], { detached: true, stdio: "ignore" }).unref();
+  } else {
+    spawn(app, args, { detached: true, stdio: "ignore" }).unref();
+  }
+}
+async function launch() {
+  const port = cdpPort();
+  if (await listTargets(port))
+    return { port, restarted: false };
+  const app = findApp();
+  await quit();
+  start(app, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1"]);
+  for (let i = 0;i < 80; i++) {
+    if (await listTargets(port)) {
+      await waitForMainWindow(port);
+      return { port, restarted: true };
+    }
+    await sleep(250);
+  }
+  throw new Error(`Grok Bot started but debug port ${port} never opened.`);
+}
+async function waitForMainWindow(port) {
+  for (let i = 0;i < 120; i++) {
+    const cdp = await CDP.connect(port).catch(() => null);
+    const ready = cdp ? await cdp.eval(APP_READY).catch(() => false) : false;
+    cdp?.close();
+    if (ready)
+      return;
+    await sleep(250);
+  }
+}
+async function restore() {
+  const app = findApp();
+  await quit();
+  start(app, []);
+}
+
 // src/bot.ts
+import { mkdir, open as openFile, readFile, stat } from "node:fs/promises";
+import { basename, extname, join as join2, resolve } from "node:path";
 var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
 var LIB = `
   const roster = ${store("roster", "createAgent")};
