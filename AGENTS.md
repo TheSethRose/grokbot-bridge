@@ -15,7 +15,7 @@
 
 - Type-check and lint: `bun run check` (tsc + Biome). Auto-fix formatting: `bun run format`.
 - Build: `bun run build`. It writes `dist/cli.js`, which is committed so installing from the GitHub tarball works. Rebuild it before every commit that touches `src/`.
-- There is no automated test suite. Verify behavior against the live app:
+- Unit tests for the pure helpers: `bun test` (in `test/`, outside `tsc`'s `src` scope). Everything that touches the app is verified against the live app:
   - Read-only checks first: `status`, `bots`, `read <bot> --limit 3`, `routines <bot>`, `usage`.
   - MCP: pipe newline-delimited JSON-RPC (`initialize`, `tools/list`, `tools/call`) into `bun src/cli.ts mcp`.
 - Any command except `status` and `restore` may restart the user's Grok Bot app with the debug port (`launch`). Tell the user before the first restart.
