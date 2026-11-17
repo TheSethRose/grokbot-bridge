@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { linuxAppCandidates, processMatchArgs } from "../src/app.ts";
+import { hasLiveProcess, linuxAppCandidates, processMatchArgs } from "../src/app.ts";
 
 describe("linuxAppCandidates", () => {
   let home: string;
@@ -48,5 +48,18 @@ describe("processMatchArgs", () => {
 
   test("on macOS keeps matching the app bundle's executable path", () => {
     expect(processMatchArgs("darwin")).toEqual(["-f", "Grok Bot.app/Contents/MacOS/Grok Bot"]);
+  });
+});
+
+describe("hasLiveProcess", () => {
+  // `ps -C grok-bot -o stat=` while the app shuts down: its helpers linger as zombies for seconds.
+  test("is false when only zombies are left, so quit doesn't wait for them", () => {
+    expect(hasLiveProcess("Z<\nZl\n")).toBe(false);
+    expect(hasLiveProcess("")).toBe(false);
+  });
+
+  test("is true while any app process is still alive", () => {
+    expect(hasLiveProcess("Sl\nZ\n")).toBe(true);
+    expect(hasLiveProcess(" S<sl\n")).toBe(true);
   });
 });

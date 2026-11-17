@@ -64,11 +64,23 @@ export async function isRunning(): Promise<boolean> {
       const { stdout } = await run("tasklist", ["/FI", `IMAGENAME eq ${PROCESS_NAME}.exe`, "/NH"]);
       return stdout.includes(PROCESS_NAME);
     }
-    await run("pgrep", processMatchArgs(process.platform));
-    return true;
+    if (process.platform === "darwin") {
+      await run("pgrep", processMatchArgs(process.platform));
+      return true;
+    }
+    const { stdout } = await run("ps", ["-C", "grok-bot", "-o", "stat="]);
+    return hasLiveProcess(stdout);
   } catch {
     return false;
   }
+}
+
+/**
+ * True if `ps -o stat=` output lists a process that isn't a zombie. On Linux the app's helpers stay
+ * zombies for seconds after it exits, and pgrep counts them, so quit() used to time out.
+ */
+export function hasLiveProcess(psStat: string): boolean {
+  return psStat.split("\n").some((line) => line.trim() !== "" && !line.trim().startsWith("Z"));
 }
 
 async function quit(): Promise<void> {
@@ -76,7 +88,8 @@ async function quit(): Promise<void> {
   if (process.platform === "darwin") await run("osascript", ["-e", `tell application "${PROCESS_NAME}" to quit`]).catch(() => {});
   else if (process.platform === "win32") await run("taskkill", ["/IM", `${PROCESS_NAME}.exe`]).catch(() => {});
   else await run("pkill", ["-TERM", ...processMatchArgs(process.platform)]).catch(() => {});
-  for (let i = 0; i < 40 && (await isRunning()); i++) await sleep(250);
+  // Electron on Linux took 6-10+ s to shut down in testing; 10 s was too tight.
+  for (let i = 0; i < 120 && (await isRunning()); i++) await sleep(250);
   if (await isRunning()) throw new Error("Grok Bot didn't quit. Quit it yourself, then rerun.");
 }
 

@@ -185,14 +185,22 @@ Set GROKBOT_APP to its path.`);
 async function isRunning() {
   try {
     if (process.platform === "win32") {
-      const { stdout } = await run("tasklist", ["/FI", `IMAGENAME eq ${PROCESS_NAME}.exe`, "/NH"]);
-      return stdout.includes(PROCESS_NAME);
+      const { stdout: stdout2 } = await run("tasklist", ["/FI", `IMAGENAME eq ${PROCESS_NAME}.exe`, "/NH"]);
+      return stdout2.includes(PROCESS_NAME);
     }
-    await run("pgrep", processMatchArgs(process.platform));
-    return true;
+    if (process.platform === "darwin") {
+      await run("pgrep", processMatchArgs(process.platform));
+      return true;
+    }
+    const { stdout } = await run("ps", ["-C", "grok-bot", "-o", "stat="]);
+    return hasLiveProcess(stdout);
   } catch {
     return false;
   }
+}
+function hasLiveProcess(psStat) {
+  return psStat.split(`
+`).some((line) => line.trim() !== "" && !line.trim().startsWith("Z"));
 }
 async function quit() {
   if (!await isRunning())
@@ -203,7 +211,7 @@ async function quit() {
     await run("taskkill", ["/IM", `${PROCESS_NAME}.exe`]).catch(() => {});
   else
     await run("pkill", ["-TERM", ...processMatchArgs(process.platform)]).catch(() => {});
-  for (let i = 0;i < 40 && await isRunning(); i++)
+  for (let i = 0;i < 120 && await isRunning(); i++)
     await sleep(250);
   if (await isRunning())
     throw new Error("Grok Bot didn't quit. Quit it yourself, then rerun.");
