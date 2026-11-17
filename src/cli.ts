@@ -16,10 +16,11 @@ import {
   wait,
   watch,
 } from "./bot.ts";
-import { CDP, cdpPort, listTargets } from "./cdp.ts";
+import { CDP, cdpPort, listTargets, serviceAvailable } from "./cdp.ts";
 import { serveMcp } from "./mcp.ts";
 import { createBot, deleteBot, updateBot } from "./roster.ts";
 import { changeRoutine, listRoutines, type Routine, type RoutineChange, type RoutineChangeResult, runRoutine } from "./routines.ts";
+import { installService, openApp, runService, UNIT_NAME } from "./service.ts";
 import { VERSION } from "./version.ts";
 
 const USAGE = `grokbot ${VERSION} — talk to your Grok Bots from the terminal or any agent
@@ -46,6 +47,9 @@ Usage:
   grokbot launch                    (Re)start Grok Bot with the local debug port
   grokbot restore                   Restart Grok Bot normally (closes the port)
   grokbot mcp                       Run as an MCP server over stdio
+  grokbot service                   Run Grok Bot with a private debug pipe instead of a port (Linux, under systemd)
+  grokbot service install           Write the systemd --user unit for the service
+  grokbot open [url]                Open Grok Bot through the service (for the desktop launcher)
 
 Options:
   --file <path>     ask/send: attach a file (repeat for several, 25 MB each)
@@ -159,8 +163,11 @@ function printChange(r: RoutineChangeResult, done: string, json: boolean): void 
 }
 
 async function withApp<T>(fn: (cdp: CDP) => Promise<T>): Promise<T> {
-  const { restarted } = await launch();
-  if (restarted) console.error("[grokbot] Restarted Grok Bot with the local debug port.");
+  const { restarted, service } = await launch();
+  if (restarted)
+    console.error(
+      service ? "[grokbot] Started Grok Bot through the grokbot service." : "[grokbot] Restarted Grok Bot with the local debug port.",
+    );
   const cdp = await CDP.connect();
   try {
     return await fn(cdp);
@@ -178,10 +185,26 @@ async function main() {
   switch (cmd) {
     case "mcp":
       return serveMcp();
+    case "service": {
+      if (args[0] !== "install") return runService();
+      const unit = installService(process.argv[1]);
+      return out(
+        { unit },
+        () => `Wrote ${unit}. Start it with:\n  systemctl --user daemon-reload && systemctl --user enable --now ${UNIT_NAME}`,
+      );
+    }
+    case "open":
+      return openApp(args);
     case "launch": {
       const r = await launch();
       return out(r, () =>
-        r.restarted ? `Grok Bot restarted with debug port ${r.port} (127.0.0.1 only).` : `Already connected on port ${r.port}.`,
+        r.service
+          ? r.restarted
+            ? "Started Grok Bot through the grokbot service."
+            : "Already connected through the grokbot service."
+          : r.restarted
+            ? `Grok Bot restarted with debug port ${r.port} (127.0.0.1 only).`
+            : `Already connected on port ${r.port}.`,
       );
     }
     case "restore":
@@ -189,14 +212,17 @@ async function main() {
       return out({ ok: true }, () => "Grok Bot restarted normally. The debug port is closed.");
     case "status": {
       const port = cdpPort();
-      if (!(await listTargets(port))) return out({ connected: false, port }, () => `Not connected (port ${port}). Run: grokbot launch`);
+      const service = await serviceAvailable();
+      const via = service ? "through the grokbot service" : `on port ${port}`;
+      if (!service && !(await listTargets(port)))
+        return out({ connected: false, port }, () => `Not connected (port ${port}). Run: grokbot launch`);
       const cdp = await CDP.connect();
       try {
         const s = await status(cdp);
         return out(
-          { connected: true, port, ...s },
+          { connected: true, port, service, ...s },
           () =>
-            `Connected on port ${port}. ${s.bots.length} Bot(s): ${s.bots.map((b) => b.name).join(", ")}${s.busy ? " · a Bot is working" : ""}${s.usage ? `\n${formatUsage(s.usage)}` : ""}`,
+            `Connected ${via}. ${s.bots.length} Bot(s): ${s.bots.map((b) => b.name).join(", ")}${s.busy ? " · a Bot is working" : ""}${s.usage ? `\n${formatUsage(s.usage)}` : ""}`,
         );
       } finally {
         cdp.close();

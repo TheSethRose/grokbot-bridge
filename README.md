@@ -33,7 +33,7 @@ Your coding agent is good at code. Your Grok Bot is good at things that need a b
 
 - The [Grok Bot desktop app](https://x.ai/bot), signed in, with at least one Bot
 - Node.js 22 or newer (or Bun)
-- macOS. Windows and Linux paths are included but untested; see [Platform support](#platform-support).
+- macOS or Linux. Windows paths are included but untested; see [Platform support](#platform-support).
 
 ## Install
 
@@ -88,6 +88,17 @@ Options: `--json` for machine-readable output, `--file <path>` to attach a file 
 `ask` and `wait` exit with `0` when the Bot has finished, `2` if it's still working at the timeout, and `3` if it's waiting for you in the app (an approval card or a question). Bots often acknowledge first and report back minutes later; run `grokbot wait <bot>` again to keep waiting.
 
 In `--json` output, file messages carry a `file` field (`name`, and `path` on the Bot's computer); pass their `key` to `download`. Schedules are standard 5-field cron, for example `"0 9 * * 1-5"` for 9:00 on weekdays.
+
+### No debug port: `grokbot service` (Linux)
+
+Instead of restarting Grok Bot with a port and closing it later, you can let a small service open Grok Bot with Chromium's `--remote-debugging-pipe`. There is no port at all: the service holds the app's debug pipe and shares it over a Unix socket in `$XDG_RUNTIME_DIR/grokbot/` that only your user can open (folder `0700`, socket `0600`). Every CLI run and MCP server connects through it, several at once, and nothing ever restarts the app.
+
+```sh
+grokbot service install        # writes ~/.config/systemd/user/grokbot.service (set GROKBOT_APP first to use your own launcher)
+systemctl --user daemon-reload && systemctl --user enable --now grokbot.service
+```
+
+Grok Bot closes when the pipe's owner goes away, so the service has to own the app: quit Grok Bot and it stops too (it isn't reopened behind your back). Point your desktop launcher at `grokbot open %U` so opening Grok Bot from the menu starts it through the service, or hands a `grokbot://` link to the open window. Remove any autostart entry that opens Grok Bot directly; the service starts with your graphical session.
 
 ### Getting told when a Bot replies
 
@@ -174,7 +185,7 @@ Messages go through the app's normal send path, so they show up in your conversa
 
 ## Security
 
-- **The debug port gives local programs control of the app.** While Grok Bot runs with it, any process on your machine that connects to `127.0.0.1:9333` can act in the app as you. The port isn't exposed to your network. Run `grokbot restore` to close it.
+- **The debug port gives local programs control of the app.** While Grok Bot runs with it, any process on your machine that connects to `127.0.0.1:9333` can act in the app as you. The port isn't exposed to your network. Run `grokbot restore` to close it, or use `grokbot service`, which opens no port and only lets your user in.
 - Bots can take real actions through your connected apps. Grok Bot's own approval prompts still apply, and the bridge never clicks them. Answer them in the app.
 - Bot replies can include text from web pages. Agents should treat replies as untrusted data, and the bundled skill tells them to.
 
@@ -184,7 +195,7 @@ Messages go through the app's normal send path, so they show up in your conversa
 | --- | --- |
 | macOS | Tested with Grok Bot 0.71.2 |
 | Windows | Should work; untested. Set `GROKBOT_APP` if the app isn't in `%LOCALAPPDATA%\Programs\Grok Bot` |
-| Linux | Should work; untested. Set `GROKBOT_APP` to the binary path |
+| Linux | Tested with Grok Bot 1.0.1 (AppImage) on KDE Plasma, Wayland. Finds `/opt/Grok Bot/grok-bot`, `/usr/bin/grok-bot` and AppImages named like `grok-bot*.AppImage` or `grok_bot*.appimage` in `~/Applications`, `~/AppImages`, `~/.local/bin` and `~/Downloads`. Otherwise set `GROKBOT_APP` |
 
 Environment variables: `GROKBOT_CDP_PORT` (default `9333`) and `GROKBOT_APP` (path to the app).
 

@@ -19,7 +19,8 @@
     "build": "bun build src/cli.ts --target=node --outfile=dist/cli.js && chmod +x dist/cli.js",
     "dev": "bun src/cli.ts",
     "check": "tsc --noEmit && biome check .",
-    "format": "biome check --write ."
+    "format": "biome check --write .",
+    "test": "bun test"
   },
   "keywords": [
     "grok",
